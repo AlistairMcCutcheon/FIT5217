@@ -13,6 +13,7 @@ import string
 from torch.utils.data import Dataset
 from glob import glob
 from pathlib import Path
+from torch import Tensor
 
 from typing import Iterable, Generator
 
@@ -27,12 +28,13 @@ class CookingDataset(Dataset):
 
         self.ingredients, self.recepies = read_ingredients_recepies(data_dir_path)
         self.lang = self.create_lang()
-        print(
-            self.lang.word2index,
-            self.lang.word2count,
-            self.lang.n_words,
-        )
-        print(get_alphabet(self.ingredients).union(get_alphabet(self.recepies)))
+        self.summarise()
+        # print(
+        #     self.lang.word2index,
+        #     self.lang.word2count,
+        #     self.lang.n_words,
+        # )
+        # print(get_alphabet(self.ingredients).union(get_alphabet(self.recepies)))
 
     def create_lang(self) -> Lang:
         lang = Lang()
@@ -42,12 +44,38 @@ class CookingDataset(Dataset):
             lang.add_sentence(text)
         return lang
 
+    def __getitem__(self, index) -> tuple[Tensor, Tensor]:
+        ingredients_tensor = tensor_from_text(self.lang, self.ingredients[index])
+        recepie_tensor = tensor_from_text(self.lang, self.ingredients[index])
+        return ingredients_tensor, recepie_tensor
+
+    def __len__(self):
+        return len(self.ingredients)
+
     def summarise(self):
+        ingredients_alphabet = get_alphabet(self.ingredients)
         print("Ingredients Alphabet:")
-        print(get_alphabet(self.ingredients))
-        print("Recepies Alphabet")
-        print(get_alphabet(self.recepies))
-        pass
+        print(ingredients_alphabet)
+        print("Ingredients Alphabet Length:")
+        print(len(ingredients_alphabet))
+
+        recepies_alphabet = get_alphabet(self.recepies)
+        print("Recepies Alphabet:")
+        print(recepies_alphabet)
+        print("Recepies Alphabet Length:")
+        print(len(recepies_alphabet))
+
+        print("Sample Ingredients:")
+        print(self.ingredients[0])
+        print("Sample Recepie:")
+        print(self.recepies[0])
+
+        print(summarise(self.ingredients))
+        print(summarise(self.recepies))
+
+        # sample_ingredients_tensor, sample_recepie_tensor = self[0]
+        # print("Sample Ingredients Tensor:")
+        # print(sample_ingredients_tensor)
 
 
 class Lang:
@@ -70,6 +98,27 @@ class Lang:
         self.word2count[word] = 1
         self.index2word[self.n_words] = word
         self.n_words += 1
+
+
+def summarise(text: CookingDataset) -> tuple(int, int, float):
+    min_length = min((len(x) for x in text))
+    max_length = max((len(x) for x in text))
+    avg_length = sum((len(x) for x in text)) / len(text)
+
+    print(text[1])
+    print("------------------")
+
+    return min_length, max_length, avg_length
+
+
+def indexes_from_text(lang: Lang, text: str):
+    return [lang.word2index[word] for word in text.split(" ")]
+
+
+def tensor_from_text(lang: Lang, text: str):
+    indexes = indexes_from_text(lang, text)
+    indexes.append(EOS_TOKEN)
+    return torch.tensor(indexes, dtype=torch.long, device=device).view(-1, 1)
 
 
 def remove_successive_chars(s: str, chars_to_keep_unchanged: set[str]):
