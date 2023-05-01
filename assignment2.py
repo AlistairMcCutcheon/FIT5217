@@ -8,18 +8,28 @@ from unidecode import unidecode
 import torch
 import torch.nn as nn
 from torch import optim
+import matplotlib.pyplot as plt
+
+plt.switch_backend("agg")
+import matplotlib.ticker as ticker
+import numpy as np
 import torch.nn.functional as F
 import string
 from torch.utils.data import Dataset
 from glob import glob
 from pathlib import Path
 from torch import Tensor
-
+import statistics
 from typing import Iterable, Generator
+from torch.optim import Optimizer
+import time
+import math
+from torch.utils.data import DataLoader
 
-
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SOS_TOKEN = 0
 EOS_TOKEN = 1
+TEACHER_FORCING_RATIO = 1
 
 
 class CookingDataset(Dataset):
@@ -29,12 +39,6 @@ class CookingDataset(Dataset):
         self.ingredients, self.recepies = read_ingredients_recepies(data_dir_path)
         self.lang = self.create_lang()
         self.summarise()
-        # print(
-        #     self.lang.word2index,
-        #     self.lang.word2count,
-        #     self.lang.n_words,
-        # )
-        # print(get_alphabet(self.ingredients).union(get_alphabet(self.recepies)))
 
     def create_lang(self) -> Lang:
         lang = Lang()
@@ -46,7 +50,7 @@ class CookingDataset(Dataset):
 
     def __getitem__(self, index) -> tuple[Tensor, Tensor]:
         ingredients_tensor = tensor_from_text(self.lang, self.ingredients[index])
-        recepie_tensor = tensor_from_text(self.lang, self.ingredients[index])
+        recepie_tensor = tensor_from_text(self.lang, self.recepies[index])
         return ingredients_tensor, recepie_tensor
 
     def __len__(self):
@@ -58,24 +62,54 @@ class CookingDataset(Dataset):
         print(ingredients_alphabet)
         print("Ingredients Alphabet Length:")
         print(len(ingredients_alphabet))
+        print()
 
         recepies_alphabet = get_alphabet(self.recepies)
         print("Recepies Alphabet:")
         print(recepies_alphabet)
         print("Recepies Alphabet Length:")
         print(len(recepies_alphabet))
+        print()
 
         print("Sample Ingredients:")
         print(self.ingredients[0])
         print("Sample Recepie:")
         print(self.recepies[0])
+        print()
 
-        print(summarise(self.ingredients))
-        print(summarise(self.recepies))
+        print("Number of Samples:")
+        print(len(self))
+        print()
 
-        # sample_ingredients_tensor, sample_recepie_tensor = self[0]
-        # print("Sample Ingredients Tensor:")
-        # print(sample_ingredients_tensor)
+        (
+            ingredients_min_len,
+            ingredients_max_len,
+            ingredients_avg_len,
+            ingredients_stdev_len,
+            ingredients_median_len,
+        ) = summarise_tokens([x[0] for x in self])
+
+        print(f"Length of shortest ingredients text: {ingredients_min_len}")
+        print(f"Length of longest ingredients text: {ingredients_max_len}")
+        print(f"Average length of ingredients text: {ingredients_avg_len}")
+        print(
+            f"Standard deviation of lengths of ingredients text: {ingredients_stdev_len}"
+        )
+        print(f"Median of lengths of ingredients text: {ingredients_median_len}")
+
+        (
+            recepie_min_len,
+            recepie_max_len,
+            recepie_avg_len,
+            recepie_stdev_len,
+            recepie_median_len,
+        ) = summarise_tokens([x[1] for x in self])
+
+        print(f"Length of shortest recepie text: {recepie_min_len}")
+        print(f"Length of longest recepie text: {recepie_max_len}")
+        print(f"Average length of recepie text: {recepie_avg_len}")
+        print(f"Standard deviation of lengths of recepie text: {recepie_stdev_len}")
+        print(f"Median of lengths of recepie text: {recepie_median_len}")
 
 
 class Lang:
@@ -100,15 +134,54 @@ class Lang:
         self.n_words += 1
 
 
-def summarise(text: CookingDataset) -> tuple(int, int, float):
-    min_length = min((len(x) for x in text))
-    max_length = max((len(x) for x in text))
-    avg_length = sum((len(x) for x in text)) / len(text)
+class EncoderRNN(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(EncoderRNN, self).__init__()
+        self.hidden_size = hidden_size
 
-    print(text[1])
-    print("------------------")
+        self.embedding = nn.Embedding(input_size, hidden_size)
+        self.gru = nn.GRU(hidden_size, hidden_size)
 
-    return min_length, max_length, avg_length
+    def forward(self, input, hidden):
+        embedded = self.embedding(input).view(1, 1, -1)
+        output = embedded
+        output, hidden = self.gru(output, hidden)
+        return output, hidden
+
+    def initHidden(self):
+        return torch.zeros(1, 1, self.hidden_size, device=DEVICE)
+
+
+class DecoderRNN(nn.Module):
+    def __init__(self, hidden_size, output_size):
+        super(DecoderRNN, self).__init__()
+        self.hidden_size = hidden_size
+
+        self.embedding = nn.Embedding(output_size, hidden_size)
+        self.gru = nn.GRU(hidden_size, hidden_size)
+        self.out = nn.Linear(hidden_size, output_size)
+        self.softmax = nn.LogSoftmax(dim=1)
+
+    def forward(self, input, hidden):
+        output = self.embedding(input).view(1, 1, -1)
+        output = F.relu(output)
+        output, hidden = self.gru(output, hidden)
+        output = self.softmax(self.out(output[0]))
+        return output, hidden
+
+    def initHidden(self):
+        return torch.zeros(1, 1, self.hidden_size, device=DEVICE)
+
+
+def summarise_tokens(tokens: list[list[int]]) -> tuple[int, int, float]:
+    lengths = [len(x) for x in tokens]
+    min_length = min(lengths)
+    max_length = max(lengths)
+    avg_length = sum(lengths) / len(lengths)
+    stdev_length = statistics.stdev(lengths)
+    median_length = statistics.median(lengths)
+
+    return min_length, max_length, avg_length, stdev_length, median_length
 
 
 def indexes_from_text(lang: Lang, text: str):
@@ -118,7 +191,7 @@ def indexes_from_text(lang: Lang, text: str):
 def tensor_from_text(lang: Lang, text: str):
     indexes = indexes_from_text(lang, text)
     indexes.append(EOS_TOKEN)
-    return torch.tensor(indexes, dtype=torch.long, device=device).view(-1, 1)
+    return torch.tensor(indexes, dtype=torch.long, device=DEVICE).view(-1, 1)
 
 
 def remove_successive_chars(s: str, chars_to_keep_unchanged: set[str]):
@@ -173,7 +246,7 @@ def normalise_string(s: str):
     return s
 
 
-def read_ingredient_recipie(
+def read_ingredient_recipe(
     text_lines: Iterable[str],
 ) -> Generator[tuple[str, str], None, None]:
     for line in text_lines:
@@ -197,15 +270,15 @@ def read_next_recepie(text_lines: Iterable[str]) -> str:
 def read_ingredients_recepies(data_dir_path: str):
     ingredients_per_recepie = []
     recepies = []
-    i = 0
-    for recipies_file_path in Path(data_dir_path).glob("*"):
-        with open(recipies_file_path, "r") as file:
-            for ingredients, recepie in read_ingredient_recipie(file):
+    # i = 0
+    for recipes_file_path in Path(data_dir_path).glob("*"):
+        with open(recipes_file_path, "r") as file:
+            for ingredients, recepie in read_ingredient_recipe(file):
                 ingredients_per_recepie.append(normalise_string(ingredients))
                 recepies.append(normalise_string(recepie))
-        if i >= 5:
-            break
-        i += 1
+        # if i >= 5:
+        #     break
+        # i += 1
     return ingredients_per_recepie, recepies
 
 
@@ -216,7 +289,142 @@ def get_alphabet(text_lines: Iterable[str]) -> set[str]:
     return alphabet
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def train(
+    input_tensor: Tensor,
+    target_tensor: Tensor,
+    encoder: EncoderRNN,
+    decoder: DecoderRNN,
+    encoder_optimizer: Optimizer,
+    decoder_optimizer: Optimizer,
+    criterion,
+):
+    encoder_hidden = encoder.initHidden()
+
+    encoder_optimizer.zero_grad()
+    decoder_optimizer.zero_grad()
+
+    input_length = input_tensor.size(0)
+    target_length = target_tensor.size(0)
+
+    encoder_outputs = torch.zeros(1000, encoder.hidden_size, device=DEVICE)
+
+    loss = 0
+
+    for ei in range(input_length):
+        encoder_output, encoder_hidden = encoder(input_tensor[ei], encoder_hidden)
+        encoder_outputs[ei] = encoder_output[0, 0]
+
+    decoder_input = torch.tensor([[SOS_TOKEN]], device=DEVICE)
+
+    decoder_hidden = encoder_hidden
+
+    use_teacher_forcing = True if random.random() < TEACHER_FORCING_RATIO else False
+
+    if use_teacher_forcing:
+        # Teacher forcing: Feed the target as the next input
+        for di in range(target_length):
+            decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
+            loss += criterion(decoder_output, target_tensor[di])
+            decoder_input = target_tensor[di]  # Teacher forcing
+
+    else:
+        # Without teacher forcing: use its own predictions as the next input
+        for di in range(target_length):
+            decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
+            topv, topi = decoder_output.topk(1)
+            decoder_input = topi.squeeze().detach()  # detach from history as input
+
+            loss += criterion(decoder_output, target_tensor[di])
+            if decoder_input.item() == EOS_TOKEN:
+                break
+
+    loss.backward()
+
+    encoder_optimizer.step()
+    decoder_optimizer.step()
+
+    return loss.item() / target_length
 
 
-x = CookingDataset("data/train")
+def asMinutes(s):
+    m = math.floor(s / 60)
+    s -= m * 60
+    return "%dm %ds" % (m, s)
+
+
+def timeSince(since, percent):
+    now = time.time()
+    s = now - since
+    es = s / (percent)
+    rs = es - s
+    return "%s (- %s)" % (asMinutes(s), asMinutes(rs))
+
+
+def trainIters(
+    dataloader: DataLoader,
+    encoder: EncoderRNN,
+    decoder: DecoderRNN,
+    print_every: int = 1000,
+    plot_every: int = 100,
+    learning_rate: float = 0.01,
+):
+    start = time.time()
+    plot_losses = []
+    print_loss_total = 0  # Reset every print_every
+    plot_loss_total = 0  # Reset every plot_every
+
+    encoder_optimizer = optim.SGD(encoder.parameters(), lr=learning_rate)
+    decoder_optimizer = optim.SGD(decoder.parameters(), lr=learning_rate)
+    criterion = nn.NLLLoss()
+
+    # for iter in range(1, n_iters + 1):
+    for i, (input_tensor, target_tensor) in enumerate(dataloader, 1):
+        loss = train(
+            input_tensor,
+            target_tensor,
+            encoder,
+            decoder,
+            encoder_optimizer,
+            decoder_optimizer,
+            criterion,
+        )
+        print_loss_total += loss
+        plot_loss_total += loss
+
+        if i % print_every == 0:
+            print_loss_avg = print_loss_total / print_every
+            print_loss_total = 0
+            print(
+                "%s (%d %d%%) %.4f"
+                % (
+                    timeSince(start, i / len(dataloader)),
+                    i,
+                    i / len(dataloader) * 100,
+                    print_loss_avg,
+                )
+            )
+
+        if i % plot_every == 0:
+            plot_loss_avg = plot_loss_total / plot_every
+            plot_losses.append(plot_loss_avg)
+            plot_loss_total = 0
+
+    show_plot(plot_losses)
+
+
+def show_plot(points):
+    plt.figure()
+    fig, ax = plt.subplots()
+    # this locator puts ticks at regular intervals
+    loc = ticker.MultipleLocator(base=0.2)
+    ax.yaxis.set_major_locator(loc)
+    plt.plot(points)
+
+
+dataset = CookingDataset("data/train")
+
+hidden_size = 256
+encoder1 = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
+attn_decoder1 = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
+
+trainIters(dataset, encoder1, attn_decoder1, print_every=5000)
