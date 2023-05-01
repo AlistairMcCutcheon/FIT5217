@@ -104,12 +104,14 @@ class CookingDataset(Dataset):
             recepie_stdev_len,
             recepie_median_len,
         ) = summarise_tokens([x[1] for x in self])
+        print()
 
         print(f"Length of shortest recepie text: {recepie_min_len}")
         print(f"Length of longest recepie text: {recepie_max_len}")
         print(f"Average length of recepie text: {recepie_avg_len}")
         print(f"Standard deviation of lengths of recepie text: {recepie_stdev_len}")
         print(f"Median of lengths of recepie text: {recepie_median_len}")
+        print()
 
 
 class Lang:
@@ -140,10 +142,10 @@ class EncoderRNN(nn.Module):
         self.hidden_size = hidden_size
 
         self.embedding = nn.Embedding(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
+        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
 
     def forward(self, input, hidden):
-        embedded = self.embedding(input).view(1, 1, -1)
+        embedded = self.embedding(input).view(1, input.shape[0], -1)
         output = embedded
         output, hidden = self.gru(output, hidden)
         return output, hidden
@@ -158,12 +160,12 @@ class DecoderRNN(nn.Module):
         self.hidden_size = hidden_size
 
         self.embedding = nn.Embedding(output_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
+        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
         self.out = nn.Linear(hidden_size, output_size)
         self.softmax = nn.LogSoftmax(dim=1)
 
     def forward(self, input, hidden):
-        output = self.embedding(input).view(1, 1, -1)
+        output = self.embedding(input).view(1, input.shape[0], -1)
         output = F.relu(output)
         output, hidden = self.gru(output, hidden)
         output = self.softmax(self.out(output[0]))
@@ -191,7 +193,7 @@ def indexes_from_text(lang: Lang, text: str):
 def tensor_from_text(lang: Lang, text: str):
     indexes = indexes_from_text(lang, text)
     indexes.append(EOS_TOKEN)
-    return torch.tensor(indexes, dtype=torch.long, device=DEVICE).view(-1, 1)
+    return torch.tensor(indexes, dtype=torch.long, device=DEVICE)  # .view(-1, 1)
 
 
 def remove_successive_chars(s: str, chars_to_keep_unchanged: set[str]):
@@ -303,18 +305,20 @@ def train(
     encoder_optimizer.zero_grad()
     decoder_optimizer.zero_grad()
 
-    input_length = input_tensor.size(0)
-    target_length = target_tensor.size(0)
+    input_length = input_tensor.size(-1)
+    target_length = target_tensor.size(-1)
 
     encoder_outputs = torch.zeros(1000, encoder.hidden_size, device=DEVICE)
 
     loss = 0
 
     for ei in range(input_length):
-        encoder_output, encoder_hidden = encoder(input_tensor[ei], encoder_hidden)
+        encoder_output, encoder_hidden = encoder(input_tensor[:, ei], encoder_hidden)
         encoder_outputs[ei] = encoder_output[0, 0]
 
-    decoder_input = torch.tensor([[SOS_TOKEN]], device=DEVICE)
+    decoder_input = torch.full(
+        (len(target_tensor),), fill_value=SOS_TOKEN, dtype=torch.long, device=DEVICE
+    )
 
     decoder_hidden = encoder_hidden
 
@@ -324,8 +328,8 @@ def train(
         # Teacher forcing: Feed the target as the next input
         for di in range(target_length):
             decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
-            loss += criterion(decoder_output, target_tensor[di])
-            decoder_input = target_tensor[di]  # Teacher forcing
+            loss += criterion(decoder_output, target_tensor[:, di])
+            decoder_input = target_tensor[:, di]  # Teacher forcing
 
     else:
         # Without teacher forcing: use its own predictions as the next input
@@ -334,7 +338,7 @@ def train(
             topv, topi = decoder_output.topk(1)
             decoder_input = topi.squeeze().detach()  # detach from history as input
 
-            loss += criterion(decoder_output, target_tensor[di])
+            loss += criterion(decoder_output, target_tensor[:, di])
             if decoder_input.item() == EOS_TOKEN:
                 break
 
@@ -364,8 +368,8 @@ def trainIters(
     dataloader: DataLoader,
     encoder: EncoderRNN,
     decoder: DecoderRNN,
-    print_every: int = 1000,
-    plot_every: int = 100,
+    print_every: int = 100,
+    plot_every: int = 500,
     learning_rate: float = 0.01,
 ):
     start = time.time()
@@ -421,10 +425,35 @@ def show_plot(points):
     plt.plot(points)
 
 
+def collate_fn(input_batch):
+    max_ingredients_length = max((len(ingredients) for ingredients, _ in input_batch))
+    max_recipe_length = max((len(recepe) for _, recepe in input_batch))
+
+    ingredients_batch = torch.full(
+        (len(input_batch), max_ingredients_length),
+        fill_value=EOS_TOKEN,
+        dtype=torch.long,
+        device=DEVICE,
+    )
+    recipes_batch = torch.full(
+        (len(input_batch), max_recipe_length),
+        fill_value=EOS_TOKEN,
+        dtype=torch.long,
+        device=DEVICE,
+    )
+
+    for i, (ingredients, recipe) in enumerate(input_batch):
+        ingredients_batch[i, : len(ingredients)] = ingredients
+        recipes_batch[i, : len(recipe)] = recipe
+
+    return ingredients_batch, recipes_batch
+
+
 dataset = CookingDataset("data/train")
+dataloader = DataLoader(dataset, 64, shuffle=True, collate_fn=collate_fn)
 
 hidden_size = 256
 encoder1 = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
 attn_decoder1 = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
 
-trainIters(dataset, encoder1, attn_decoder1, print_every=5000)
+trainIters(dataloader, encoder1, attn_decoder1, print_every=100)
