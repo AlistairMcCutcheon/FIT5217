@@ -168,11 +168,12 @@ class EncoderRNN(nn.Module):
 
 
 class DecoderRNN(nn.Module):
-    def __init__(self, hidden_size, output_size):
+    def __init__(self, hidden_size, output_size, dropout=0.1):
         super(DecoderRNN, self).__init__()
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.embedding = nn.Embedding(output_size, hidden_size)
+        self.dropout = nn.Dropout(dropout)
         self.gru = nn.GRU(hidden_size, hidden_size)
         self.out = nn.Linear(hidden_size, output_size)
         self.softmax = nn.LogSoftmax(dim=1)
@@ -182,6 +183,7 @@ class DecoderRNN(nn.Module):
         embedded = self.embedding(input).view(
             sequence_length, batch_size, self.hidden_size
         )
+        output = self.dropout(embedded)
         output = F.relu(embedded)
         output, hidden = self.gru(output, hidden)
 
@@ -191,6 +193,43 @@ class DecoderRNN(nn.Module):
         output = output.view(sequence_length, batch_size, self.output_size)
 
         return output, hidden
+
+
+class AttnDecoderRNN(nn.Module):
+    def __init__(self, hidden_size, output_size, dropout_p=0.1, max_len=150):
+        super(AttnDecoderRNN, self).__init__()
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+
+        self.embedding = nn.Embedding(self.output_size, self.hidden_size)
+        self.attn = nn.Linear(self.hidden_size * 2, max_len)
+        self.attn_combine = nn.Linear(self.hidden_size * 2, self.hidden_size)
+        self.dropout = nn.Dropout(dropout_p)
+        self.gru = nn.GRU(self.hidden_size, self.hidden_size)
+        self.out = nn.Linear(self.hidden_size, self.output_size)
+
+    def forward(self, input, hidden, encoder_outputs):
+        embedded = self.embedding(input).view(1, 1, -1)
+        embedded = self.dropout(embedded)
+
+        attn_weights = F.softmax(
+            self.attn(torch.cat((embedded[0], hidden[0]), 1)), dim=1
+        )
+        attn_applied = torch.bmm(
+            attn_weights.unsqueeze(0), encoder_outputs.unsqueeze(0)
+        )
+
+        output = torch.cat((embedded[0], attn_applied[0]), 1)
+        output = self.attn_combine(output).unsqueeze(0)
+
+        output = F.relu(output)
+        output, hidden = self.gru(output, hidden)
+
+        output = F.log_softmax(self.out(output[0]), dim=1)
+        return output, hidden, attn_weights
+
+    def initHidden(self):
+        return torch.zeros(1, 1, self.hidden_size, device=device)
 
 
 class SequenceNLLLoss(nn.Module):
@@ -208,6 +247,18 @@ class SequenceNLLLoss(nn.Module):
                 / sequence_length
             )
         return loss
+
+
+class SeqToSeq(nn.Module):
+    def __init__(self, encoder: EncoderRNN, decoder: DecoderRNN) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(self, input, target):
+        _, encoder_hidden = encoder(input)
+        decoder_output, _ = decoder(target, encoder_hidden)
+        return decoder_output
 
 
 def create_lang(ingredients: list[str], recipes: list[str]) -> Lang:
@@ -338,30 +389,23 @@ def get_alphabet(text_lines: Iterable[str]) -> set[str]:
 
 def train(
     dataloader: DataLoader,
-    encoder: EncoderRNN,
-    decoder: DecoderRNN,
-    encoder_optimizer: Optimizer,
-    decoder_optimizer: Optimizer,
+    seq_to_seq,
+    optimiser: Optimizer,
     criterion,
     writer: SummaryWriter,
 ):
-    for i, (input_tensor, target_tensor) in enumerate(dataloader, 1):
+    for i, (input_tensor, target_tensor) in enumerate(dataloader):
         batch_size = input_tensor.shape[0]
-        encoder_optimizer.zero_grad()
-        decoder_optimizer.zero_grad()
+        seq_to_seq.zero_grad()
 
         input_length = input_tensor.shape[-1]
         target_length = target_tensor.shape[-1]
 
-        encoder_output, encoder_hidden = encoder(input_tensor)
-        decoder_output, decoder_hidden = decoder(target_tensor, encoder_hidden)
-        loss = criterion(
-            decoder_output.view(batch_size, target_length, -1), target_tensor
-        )
+        output = seq_to_seq.forward(input_tensor, target_tensor)
+        loss = criterion(output.view(batch_size, target_length, -1), target_tensor)
         loss.backward()
 
-        encoder_optimizer.step()
-        decoder_optimizer.step()
+        optimiser.step()
         writer.add_scalar("Loss", loss.item(), i)
 
 
@@ -396,20 +440,20 @@ dataloader = DataLoader(dataset, 32, shuffle=True, collate_fn=collate_fn)
 hidden_size = 256
 encoder = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
 decoder = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
-
+# decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
+seq_to_seq = SeqToSeq(encoder, decoder)
 writer = SummaryWriter()
 
 learning_rate = 0.001
-encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
-decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate)
+optimiser = optim.Adam(seq_to_seq.parameters(), lr=learning_rate)
+# encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
+# decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate)
 criterion = SequenceNLLLoss()
 
 train(
     dataloader,
-    encoder,
-    decoder,
-    encoder_optimizer,
-    decoder_optimizer,
+    seq_to_seq,
+    optimiser,
     criterion,
     writer,
 )
