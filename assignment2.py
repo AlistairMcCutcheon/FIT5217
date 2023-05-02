@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from torch import optim
 import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
 
 plt.switch_backend("agg")
 import matplotlib.ticker as ticker
@@ -20,7 +21,7 @@ from glob import glob
 from pathlib import Path
 from torch import Tensor
 import statistics
-from typing import Iterable, Generator
+from typing import Any, Iterable, Generator
 from torch.optim import Optimizer
 import time
 import math
@@ -49,8 +50,12 @@ class CookingDataset(Dataset):
         return lang
 
     def __getitem__(self, index) -> tuple[Tensor, Tensor]:
-        ingredients_tensor = tensor_from_text(self.lang, self.ingredients[index])
-        recepie_tensor = tensor_from_text(self.lang, self.recepies[index])
+        ingredients_tensor = tensor_from_text(
+            self.lang, self.ingredients[index], sos_token=False, eos_token=True
+        )
+        recepie_tensor = tensor_from_text(
+            self.lang, self.recepies[index], sos_token=True, eos_token=True
+        )
         return ingredients_tensor, recepie_tensor
 
     def __len__(self):
@@ -79,6 +84,10 @@ class CookingDataset(Dataset):
 
         print("Number of Samples:")
         print(len(self))
+        print()
+
+        print("Vocabulary Size, including SOS_TOKEN and EOS_TOKEN:")
+        print(self.lang.n_words)
         print()
 
         (
@@ -142,37 +151,66 @@ class EncoderRNN(nn.Module):
         self.hidden_size = hidden_size
 
         self.embedding = nn.Embedding(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
+        self.gru = nn.GRU(hidden_size, hidden_size)
 
-    def forward(self, input, hidden):
-        embedded = self.embedding(input).view(1, input.shape[0], -1)
-        output = embedded
-        output, hidden = self.gru(output, hidden)
+    def forward(self, input):
+        # input: sequence_length, batch_size, input_size ie embedding size
+
+        # for ei in range(input_length):
+        #     # encoder_output, encoder_hidden = encoder(input[:, ei], encoder_hidden)
+        #     print(encoder_output.shape, encoder_hidden.shape)
+        # encoder_outputs[:, ei] = encoder_output[:, 0]
+
+        batch_size, sequence_length = input.shape
+        embedded = self.embedding(input).view(
+            sequence_length, batch_size, self.hidden_size
+        )
+        hidden_0 = torch.zeros((1, batch_size, self.hidden_size), device=DEVICE)
+        output, hidden = self.gru(embedded, hidden_0)
         return output, hidden
-
-    def initHidden(self):
-        return torch.zeros(1, 1, self.hidden_size, device=DEVICE)
 
 
 class DecoderRNN(nn.Module):
     def __init__(self, hidden_size, output_size):
         super(DecoderRNN, self).__init__()
         self.hidden_size = hidden_size
-
+        self.output_size = output_size
         self.embedding = nn.Embedding(output_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
+        self.gru = nn.GRU(hidden_size, hidden_size)
         self.out = nn.Linear(hidden_size, output_size)
         self.softmax = nn.LogSoftmax(dim=1)
 
     def forward(self, input, hidden):
-        output = self.embedding(input).view(1, input.shape[0], -1)
-        output = F.relu(output)
+        batch_size, sequence_length = input.shape
+        embedded = self.embedding(input).view(
+            sequence_length, batch_size, self.hidden_size
+        )
+        output = F.relu(embedded)
         output, hidden = self.gru(output, hidden)
-        output = self.softmax(self.out(output[0]))
+
+        output = output.view(-1, self.hidden_size)
+        output = self.out(output)
+        output = self.softmax(output)
+        output = output.view(sequence_length, batch_size, self.output_size)
+
         return output, hidden
 
-    def initHidden(self):
-        return torch.zeros(1, 1, self.hidden_size, device=DEVICE)
+
+class SequenceNLLLoss(nn.Module):
+    def forward(self, input, target) -> Any:
+        # input is batch_size, sequence_length, vocab_size
+        loss_fn = nn.NLLLoss(reduction="sum")
+        loss = 0
+        for sequence, target_sequence in zip(input, target):
+            sequence_length = torch.max(target_sequence == EOS_TOKEN, dim=0)[1]
+            loss += (
+                loss_fn(
+                    sequence[: sequence_length + 1],
+                    target_sequence[: sequence_length + 1],
+                )
+                / sequence_length
+            )
+        return loss
 
 
 def summarise_tokens(tokens: list[list[int]]) -> tuple[int, int, float]:
@@ -190,9 +228,15 @@ def indexes_from_text(lang: Lang, text: str):
     return [lang.word2index[word] for word in text.split(" ")]
 
 
-def tensor_from_text(lang: Lang, text: str):
+def tensor_from_text(
+    lang: Lang, text: str, sos_token: bool = False, eos_token: bool = False
+):
     indexes = indexes_from_text(lang, text)
-    indexes.append(EOS_TOKEN)
+    if sos_token:
+        indexes.insert(0, SOS_TOKEN)
+    if eos_token:
+        indexes.append(EOS_TOKEN)
+
     return torch.tensor(indexes, dtype=torch.long, device=DEVICE)  # .view(-1, 1)
 
 
@@ -272,15 +316,15 @@ def read_next_recepie(text_lines: Iterable[str]) -> str:
 def read_ingredients_recepies(data_dir_path: str):
     ingredients_per_recepie = []
     recepies = []
-    # i = 0
+    i = 0
     for recipes_file_path in Path(data_dir_path).glob("*"):
         with open(recipes_file_path, "r") as file:
             for ingredients, recepie in read_ingredient_recipe(file):
                 ingredients_per_recepie.append(normalise_string(ingredients))
                 recepies.append(normalise_string(recepie))
-        # if i >= 5:
-        #     break
-        # i += 1
+        if i >= 10:
+            break
+        i += 1
     return ingredients_per_recepie, recepies
 
 
@@ -292,94 +336,87 @@ def get_alphabet(text_lines: Iterable[str]) -> set[str]:
 
 
 def train(
-    input_tensor: Tensor,
-    target_tensor: Tensor,
+    input: Tensor,
+    target: Tensor,
     encoder: EncoderRNN,
     decoder: DecoderRNN,
     encoder_optimizer: Optimizer,
     decoder_optimizer: Optimizer,
     criterion,
 ):
-    encoder_hidden = encoder.initHidden()
+    batch_size = input.shape[0]
+    # encoder_hidden = encoder.init_hidden(batch_size)
 
     encoder_optimizer.zero_grad()
     decoder_optimizer.zero_grad()
 
-    input_length = input_tensor.size(-1)
-    target_length = target_tensor.size(-1)
+    input_length = input.shape[-1]
+    target_length = target.shape[-1]
 
-    encoder_outputs = torch.zeros(1000, encoder.hidden_size, device=DEVICE)
+    # encoder_outputs = torch.zeros(input_length, encoder.hidden_size, device=DEVICE)
 
     loss = 0
 
-    for ei in range(input_length):
-        encoder_output, encoder_hidden = encoder(input_tensor[:, ei], encoder_hidden)
-        encoder_outputs[ei] = encoder_output[0, 0]
+    encoder_output, encoder_hidden = encoder(input)
 
-    decoder_input = torch.full(
-        (len(target_tensor),), fill_value=SOS_TOKEN, dtype=torch.long, device=DEVICE
-    )
+    # for ei in range(input_length):
+    #     # encoder_output, encoder_hidden = encoder(input[:, ei], encoder_hidden)
+    #     print(encoder_output.shape, encoder_hidden.shape)
+    # encoder_outputs[:, ei] = encoder_output[:, 0]
 
-    decoder_hidden = encoder_hidden
+    # decoder_input = torch.full(
+    #     (batch_size,), fill_value=SOS_TOKEN, dtype=torch.long, device=DEVICE
+    # )
 
-    use_teacher_forcing = True if random.random() < TEACHER_FORCING_RATIO else False
+    # decoder_hidden = encoder_hidden
 
-    if use_teacher_forcing:
-        # Teacher forcing: Feed the target as the next input
-        for di in range(target_length):
-            decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
-            loss += criterion(decoder_output, target_tensor[:, di])
-            decoder_input = target_tensor[:, di]  # Teacher forcing
+    decoder_output, decoder_hidden = decoder(target, encoder_hidden)
 
-    else:
-        # Without teacher forcing: use its own predictions as the next input
-        for di in range(target_length):
-            decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
-            topv, topi = decoder_output.topk(1)
-            decoder_input = topi.squeeze().detach()  # detach from history as input
+    # print(decoder_output.shape)
+    # print(target.shape)
+    # decoder_output = decoder_output
+    # print(decoder_output.shape)
 
-            loss += criterion(decoder_output, target_tensor[:, di])
-            if decoder_input.item() == EOS_TOKEN:
-                break
+    # target = target.view(batch_size * target_length)
+    # print(target.shape)
+    loss += criterion(decoder_output.view(batch_size, target_length, -1), target)
+    # if use_teacher_forcing:
+    #     # Teacher forcing: Feed the target as the next input
+
+    #     for di in range(target_length):
+    #         decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
+    #         loss += criterion(decoder_output, target[:, di])
+    #         decoder_input = target[:, di]  # Teacher forcing
+
+    # else:
+    #     # Without teacher forcing: use its own predictions as the next input
+    #     for di in range(target_length):
+    #         decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
+    #         topv, topi = decoder_output.topk(1)
+    #         decoder_input = topi.squeeze().detach()  # detach from history as input
+
+    #         loss += criterion(decoder_output, target[:, di])
+    #         if decoder_input.item() == EOS_TOKEN:
+    #             break
 
     loss.backward()
 
     encoder_optimizer.step()
     decoder_optimizer.step()
 
-    return loss.item() / target_length
-
-
-def asMinutes(s):
-    m = math.floor(s / 60)
-    s -= m * 60
-    return "%dm %ds" % (m, s)
-
-
-def timeSince(since, percent):
-    now = time.time()
-    s = now - since
-    es = s / (percent)
-    rs = es - s
-    return "%s (- %s)" % (asMinutes(s), asMinutes(rs))
+    return loss.item()
 
 
 def trainIters(
     dataloader: DataLoader,
     encoder: EncoderRNN,
     decoder: DecoderRNN,
-    print_every: int = 100,
-    plot_every: int = 500,
-    learning_rate: float = 0.01,
+    writer: SummaryWriter,
+    learning_rate: float = 0.001,
 ):
-    start = time.time()
-    plot_losses = []
-    print_loss_total = 0  # Reset every print_every
-    plot_loss_total = 0  # Reset every plot_every
-
-    encoder_optimizer = optim.SGD(encoder.parameters(), lr=learning_rate)
-    decoder_optimizer = optim.SGD(decoder.parameters(), lr=learning_rate)
-    criterion = nn.NLLLoss()
+    encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
+    decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate)
+    criterion = SequenceNLLLoss()
 
     # for iter in range(1, n_iters + 1):
     for i, (input_tensor, target_tensor) in enumerate(dataloader, 1):
@@ -392,37 +429,7 @@ def trainIters(
             decoder_optimizer,
             criterion,
         )
-        print_loss_total += loss
-        plot_loss_total += loss
-
-        if i % print_every == 0:
-            print_loss_avg = print_loss_total / print_every
-            print_loss_total = 0
-            print(
-                "%s (%d %d%%) %.4f"
-                % (
-                    timeSince(start, i / len(dataloader)),
-                    i,
-                    i / len(dataloader) * 100,
-                    print_loss_avg,
-                )
-            )
-
-        if i % plot_every == 0:
-            plot_loss_avg = plot_loss_total / plot_every
-            plot_losses.append(plot_loss_avg)
-            plot_loss_total = 0
-
-    show_plot(plot_losses)
-
-
-def show_plot(points):
-    plt.figure()
-    fig, ax = plt.subplots()
-    # this locator puts ticks at regular intervals
-    loc = ticker.MultipleLocator(base=0.2)
-    ax.yaxis.set_major_locator(loc)
-    plt.plot(points)
+        writer.add_scalar("Loss", loss, i)
 
 
 def collate_fn(input_batch):
@@ -450,10 +457,11 @@ def collate_fn(input_batch):
 
 
 dataset = CookingDataset("data/train")
-dataloader = DataLoader(dataset, 64, shuffle=True, collate_fn=collate_fn)
+dataloader = DataLoader(dataset, 32, shuffle=True, collate_fn=collate_fn)
 
 hidden_size = 256
 encoder1 = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
 attn_decoder1 = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
 
-trainIters(dataloader, encoder1, attn_decoder1, print_every=100)
+writer = SummaryWriter()
+trainIters(dataloader, encoder1, attn_decoder1, writer)
