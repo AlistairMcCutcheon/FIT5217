@@ -1,36 +1,25 @@
 from __future__ import unicode_literals, print_function, division, annotations
 from io import open
-import unicodedata
 import string
-import re
-import random
 from unidecode import unidecode
 import torch
 import torch.nn as nn
 from torch import optim
-import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 
-plt.switch_backend("agg")
-import matplotlib.ticker as ticker
-import numpy as np
 import torch.nn.functional as F
 import string
 from torch.utils.data import Dataset
-from glob import glob
 from pathlib import Path
 from torch import Tensor
 import statistics
 from typing import Any, Iterable, Generator
 from torch.optim import Optimizer
-import time
-import math
 from torch.utils.data import DataLoader
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SOS_TOKEN = 0
 EOS_TOKEN = 1
-TEACHER_FORCING_RATIO = 1
 
 
 class CookingDataset(Dataset):
@@ -155,11 +144,6 @@ class EncoderRNN(nn.Module):
 
     def forward(self, input):
         # input: sequence_length, batch_size, input_size ie embedding size
-
-        # for ei in range(input_length):
-        #     # encoder_output, encoder_hidden = encoder(input[:, ei], encoder_hidden)
-        #     print(encoder_output.shape, encoder_hidden.shape)
-        # encoder_outputs[:, ei] = encoder_output[:, 0]
 
         batch_size, sequence_length = input.shape
         embedded = self.embedding(input).view(
@@ -336,100 +320,33 @@ def get_alphabet(text_lines: Iterable[str]) -> set[str]:
 
 
 def train(
-    input: Tensor,
-    target: Tensor,
+    dataloader: DataLoader,
     encoder: EncoderRNN,
     decoder: DecoderRNN,
     encoder_optimizer: Optimizer,
     decoder_optimizer: Optimizer,
     criterion,
-):
-    batch_size = input.shape[0]
-    # encoder_hidden = encoder.init_hidden(batch_size)
-
-    encoder_optimizer.zero_grad()
-    decoder_optimizer.zero_grad()
-
-    input_length = input.shape[-1]
-    target_length = target.shape[-1]
-
-    # encoder_outputs = torch.zeros(input_length, encoder.hidden_size, device=DEVICE)
-
-    loss = 0
-
-    encoder_output, encoder_hidden = encoder(input)
-
-    # for ei in range(input_length):
-    #     # encoder_output, encoder_hidden = encoder(input[:, ei], encoder_hidden)
-    #     print(encoder_output.shape, encoder_hidden.shape)
-    # encoder_outputs[:, ei] = encoder_output[:, 0]
-
-    # decoder_input = torch.full(
-    #     (batch_size,), fill_value=SOS_TOKEN, dtype=torch.long, device=DEVICE
-    # )
-
-    # decoder_hidden = encoder_hidden
-
-    decoder_output, decoder_hidden = decoder(target, encoder_hidden)
-
-    # print(decoder_output.shape)
-    # print(target.shape)
-    # decoder_output = decoder_output
-    # print(decoder_output.shape)
-
-    # target = target.view(batch_size * target_length)
-    # print(target.shape)
-    loss += criterion(decoder_output.view(batch_size, target_length, -1), target)
-    # if use_teacher_forcing:
-    #     # Teacher forcing: Feed the target as the next input
-
-    #     for di in range(target_length):
-    #         decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
-    #         loss += criterion(decoder_output, target[:, di])
-    #         decoder_input = target[:, di]  # Teacher forcing
-
-    # else:
-    #     # Without teacher forcing: use its own predictions as the next input
-    #     for di in range(target_length):
-    #         decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
-    #         topv, topi = decoder_output.topk(1)
-    #         decoder_input = topi.squeeze().detach()  # detach from history as input
-
-    #         loss += criterion(decoder_output, target[:, di])
-    #         if decoder_input.item() == EOS_TOKEN:
-    #             break
-
-    loss.backward()
-
-    encoder_optimizer.step()
-    decoder_optimizer.step()
-
-    return loss.item()
-
-
-def trainIters(
-    dataloader: DataLoader,
-    encoder: EncoderRNN,
-    decoder: DecoderRNN,
     writer: SummaryWriter,
     learning_rate: float = 0.001,
 ):
-    encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
-    decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate)
-    criterion = SequenceNLLLoss()
-
-    # for iter in range(1, n_iters + 1):
     for i, (input_tensor, target_tensor) in enumerate(dataloader, 1):
-        loss = train(
-            input_tensor,
-            target_tensor,
-            encoder,
-            decoder,
-            encoder_optimizer,
-            decoder_optimizer,
-            criterion,
+        batch_size = input_tensor.shape[0]
+        encoder_optimizer.zero_grad()
+        decoder_optimizer.zero_grad()
+
+        input_length = input_tensor.shape[-1]
+        target_length = target_tensor.shape[-1]
+
+        encoder_output, encoder_hidden = encoder(input_tensor)
+        decoder_output, decoder_hidden = decoder(target_tensor, encoder_hidden)
+        loss = criterion(
+            decoder_output.view(batch_size, target_length, -1), target_tensor
         )
-        writer.add_scalar("Loss", loss, i)
+        loss.backward()
+
+        encoder_optimizer.step()
+        decoder_optimizer.step()
+        writer.add_scalar("Loss", loss.item(), i)
 
 
 def collate_fn(input_batch):
@@ -460,8 +377,23 @@ dataset = CookingDataset("data/train")
 dataloader = DataLoader(dataset, 32, shuffle=True, collate_fn=collate_fn)
 
 hidden_size = 256
-encoder1 = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
-attn_decoder1 = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
+encoder = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
+decoder = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
 
 writer = SummaryWriter()
-trainIters(dataloader, encoder1, attn_decoder1, writer)
+
+learning_rate = 0.001
+encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
+decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate)
+criterion = SequenceNLLLoss()
+
+train(
+    dataloader,
+    encoder,
+    decoder,
+    encoder_optimizer,
+    decoder_optimizer,
+    criterion,
+    writer,
+    learning_rate,
+)
