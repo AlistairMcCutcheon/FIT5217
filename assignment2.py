@@ -269,7 +269,7 @@ class SequenceNLLLoss(nn.Module):
                 )
                 / input_seq_length
             )
-        return loss
+        return loss / len(input_seq_unpacked)
 
 
 class SeqToSeq(nn.Module):
@@ -428,16 +428,18 @@ def train(
     optimiser: Optimizer,
     criterion,
     writer: SummaryWriter,
+    epochs: int = 10,
 ):
-    for i, (input_tensor, target_tensor) in enumerate(dataloader):
-        seq_to_seq.zero_grad()
+    for epoch in range(epochs):
+        for i, (input_tensor, target_tensor) in enumerate(dataloader):
+            seq_to_seq.zero_grad()
 
-        output = seq_to_seq.forward(input_tensor, target_tensor)
-        loss = criterion(output, target_tensor)
-        loss.backward()
+            output = seq_to_seq.forward(input_tensor, target_tensor)
+            loss = criterion(output, target_tensor)
+            loss.backward()
 
-        optimiser.step()
-        writer.add_scalar("Loss", loss.item(), i)
+            optimiser.step()
+            writer.add_scalar("Loss", loss.item(), epoch * len(dataloader) + i)
 
 
 def collate_fn(input_batch):
@@ -453,16 +455,16 @@ def collate_fn(input_batch):
 
 dataset = CookingDataset("data/train")
 dataset.summarise()
-dataloader = DataLoader(dataset, 32, shuffle=True, collate_fn=collate_fn)
+dataloader = DataLoader(dataset, 64, shuffle=True, collate_fn=collate_fn)
 
 hidden_size = 256
 encoder = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
 
-decoder = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
-seq_to_seq = SeqToSeq(encoder, decoder)
+# decoder = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
+# seq_to_seq = SeqToSeq(encoder, decoder)
 
-# decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
-# seq_to_seq = SeqToSeqWithAttention(encoder, decoder)
+decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
+seq_to_seq = SeqToSeqWithAttention(encoder, decoder)
 
 writer = SummaryWriter()
 
