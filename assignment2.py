@@ -208,50 +208,46 @@ class DecoderRNN(nn.Module):
 
 
 class AttnDecoderRNN(nn.Module):
-    def __init__(self, hidden_size, output_size, dropout_p=0.1, max_len=150):
+    def __init__(self, hidden_size, output_size, dropout_p=0.1):
         super(AttnDecoderRNN, self).__init__()
-        self.hidden_size = hidden_size
-        self.output_size = output_size
 
-        self.embedding = nn.Embedding(self.output_size, self.hidden_size)
-        self.attn = nn.Linear(self.hidden_size * 2, max_len)
-        self.attn_combine = nn.Linear(self.hidden_size * 2, self.hidden_size)
+        self.embedding = nn.Embedding(output_size, hidden_size)
         self.dropout = nn.Dropout(dropout_p)
-        self.gru = nn.GRU(self.hidden_size, self.hidden_size)
-        self.out = nn.Linear(self.hidden_size, self.output_size)
+        self.gru = nn.GRU(hidden_size, hidden_size)
+        self.out = nn.Linear(hidden_size * 2, output_size)
 
-    def forward(self, input, hidden, encoder_outputs):
-        print(input.shape)
-        print(hidden.shape)
-        print(encoder_outputs.shape)
-        batch_size, sequence_length = input.shape
-        embedded = self.embedding(input).view(
-            sequence_length, batch_size, self.hidden_size
-        )
+    def forward(self, input: PackedSequence, hidden, encoder_outputs: PackedSequence):
+        seq_unpacked, lens_unpacked = pad_packed_sequence(input, batch_first=True)
+        embedded = self.embedding(seq_unpacked)
+        embedded = F.relu(embedded)
         embedded = self.dropout(embedded)
 
-        print(embedded.shape)
-
-        features = torch.cat((embedded[0], hidden[0]), 1)
-        print(features.shape)
-        features = self.attn(features)
-        attention_weights = F.softmax(features, dim=1)
-
-        print(attention_weights.shape)
-        print(encoder_outputs.shape)
-
-        attn_applied = torch.bmm(
-            attention_weights.unsqueeze(0), encoder_outputs[0].unsqueeze(0)
+        embedded = pack_padded_sequence(
+            embedded, lens_unpacked, batch_first=True, enforce_sorted=False
         )
 
-        output = torch.cat((embedded[0], attn_applied[0]), 1)
-        output = self.attn_combine(output).unsqueeze(0)
+        decoder_output, _ = self.gru(embedded, hidden)
+        decoder_output_unpacked, decoder_output_lens_unpacked = pad_packed_sequence(
+            decoder_output, batch_first=True
+        )
+        encoder_out_unpacked, _ = pad_packed_sequence(encoder_outputs, batch_first=True)
 
-        output = F.relu(output)
-        output, hidden = self.gru(output, hidden)
+        attention_scores = torch.bmm(
+            decoder_output_unpacked, encoder_out_unpacked.transpose(2, 1)
+        )
+        attention_distribution = F.softmax(attention_scores, dim=2)
+        attention_output = torch.bmm(attention_distribution, encoder_out_unpacked)
 
-        output = F.log_softmax(self.out(output[0]), dim=1)
-        return output, hidden, attn_weights
+        features = torch.cat((attention_output, decoder_output_unpacked), dim=2)
+        out = self.out(features.view(-1, features.shape[-1])).view(
+            features.shape[0], features.shape[1], -1
+        )
+        out = F.log_softmax(out, dim=2)
+        out = pack_padded_sequence(
+            out, decoder_output_lens_unpacked, batch_first=True, enforce_sorted=False
+        )
+
+        return out, hidden, attention_scores
 
 
 class SequenceNLLLoss(nn.Module):
@@ -407,15 +403,15 @@ def read_next_recepie(text_lines: Iterable[str]) -> str:
 def read_ingredients_recepies(data_dir_path: str):
     ingredients_per_recepie = []
     recepies = []
-    i = 0
+    # i = 0
     for recipes_file_path in Path(data_dir_path).glob("*"):
         with open(recipes_file_path, "r") as file:
             for ingredients, recepie in read_ingredient_recipe(file):
                 ingredients_per_recepie.append(normalise_string(ingredients))
                 recepies.append(normalise_string(recepie))
-        if i >= 5:
-            break
-        i += 1
+        # if i >= 5:
+        #     break
+        # i += 1
     return ingredients_per_recepie, recepies
 
 
@@ -450,25 +446,6 @@ def train(
 
 
 def collate_fn(input_batch):
-    # max_ingredients_length = max((len(ingredients) for ingredients, _ in input_batch))
-    # max_recipe_length = max((len(recepe) for _, recepe in input_batch))
-
-    # ingredients_batch = torch.full(
-    #     (len(input_batch), max_ingredients_length),
-    #     fill_value=EOS_TOKEN,
-    #     dtype=torch.long,
-    #     device=DEVICE,
-    # )
-    # recipes_batch = torch.full(
-    #     (len(input_batch), max_recipe_length),
-    #     fill_value=EOS_TOKEN,
-    #     dtype=torch.long,
-    #     device=DEVICE,
-    # )
-
-    # for i, (ingredients, recipe) in enumerate(input_batch):
-    #     ingredients_batch[i, : len(ingredients)] = ingredients
-    #     recipes_batch[i, : len(recipe)] = recipe
     ingredients_batch = pack_sequence(
         [ingredients for ingredients, _ in input_batch], enforce_sorted=False
     )
@@ -486,18 +463,16 @@ dataloader = DataLoader(dataset, 32, shuffle=True, collate_fn=collate_fn)
 hidden_size = 256
 encoder = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
 
-decoder = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
-seq_to_seq = SeqToSeq(encoder, decoder)
+# decoder = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
+# seq_to_seq = SeqToSeq(encoder, decoder)
 
-# decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
-# seq_to_seq = SeqToSeqWithAttention(encoder, decoder)
+decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
+seq_to_seq = SeqToSeqWithAttention(encoder, decoder)
 
 writer = SummaryWriter()
 
 learning_rate = 0.001
 optimiser = optim.Adam(seq_to_seq.parameters(), lr=learning_rate)
-# encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
-# decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate)
 criterion = SequenceNLLLoss()
 
 train(
