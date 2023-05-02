@@ -16,6 +16,7 @@ import statistics
 from typing import Any, Iterable, Generator
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
+import numpy as np
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SOS_TOKEN = 0
@@ -23,29 +24,41 @@ EOS_TOKEN = 1
 
 
 class CookingDataset(Dataset):
-    def __init__(self, data_dir_path: str) -> None:
+    def __init__(self, data_dir_path: str, max_len: int = 150) -> None:
         super().__init__()
 
-        self.ingredients, self.recepies = read_ingredients_recepies(data_dir_path)
-        self.lang = self.create_lang()
-        self.summarise()
+        self.ingredients, self.recipes = read_ingredients_recepies(data_dir_path)
 
-    def create_lang(self) -> Lang:
-        lang = Lang()
-        for text in self.ingredients:
-            lang.add_sentence(text)
-        for text in self.recepies:
-            lang.add_sentence(text)
-        return lang
+        self.lang = create_lang(self.ingredients, self.recipes)
+
+        tokenised_ingredients = [
+            indexes_from_text(self.lang, x, sos_token=False, eos_token=True)
+            for x in self.ingredients
+        ]
+        tokenised_recipes = [
+            indexes_from_text(self.lang, x, sos_token=True, eos_token=True)
+            for x in self.recipes
+        ]
+
+        indexes = {
+            i
+            for i, (x, y) in enumerate(zip(tokenised_ingredients, tokenised_recipes))
+            if len(x) <= 150 and len(y) <= max_len
+        }
+
+        self.ingredients = [self.ingredients[x] for x in indexes]
+        self.recipes = [self.recipes[x] for x in indexes]
+        self.tokenised_ingredients = [tokenised_ingredients[x] for x in indexes]
+        self.tokenised_recipes = [tokenised_recipes[x] for x in indexes]
 
     def __getitem__(self, index) -> tuple[Tensor, Tensor]:
-        ingredients_tensor = tensor_from_text(
-            self.lang, self.ingredients[index], sos_token=False, eos_token=True
+        ingredients_tensor = torch.tensor(
+            self.tokenised_ingredients[index], dtype=torch.long, device=DEVICE
         )
-        recepie_tensor = tensor_from_text(
-            self.lang, self.recepies[index], sos_token=True, eos_token=True
+        recepe_tensor = torch.tensor(
+            self.tokenised_recipes[index], dtype=torch.long, device=DEVICE
         )
-        return ingredients_tensor, recepie_tensor
+        return ingredients_tensor, recepe_tensor
 
     def __len__(self):
         return len(self.ingredients)
@@ -58,7 +71,7 @@ class CookingDataset(Dataset):
         print(len(ingredients_alphabet))
         print()
 
-        recepies_alphabet = get_alphabet(self.recepies)
+        recepies_alphabet = get_alphabet(self.recipes)
         print("Recepies Alphabet:")
         print(recepies_alphabet)
         print("Recepies Alphabet Length:")
@@ -68,7 +81,7 @@ class CookingDataset(Dataset):
         print("Sample Ingredients:")
         print(self.ingredients[0])
         print("Sample Recepie:")
-        print(self.recepies[0])
+        print(self.recipes[0])
         print()
 
         print("Number of Samples:")
@@ -197,6 +210,15 @@ class SequenceNLLLoss(nn.Module):
         return loss
 
 
+def create_lang(ingredients: list[str], recipes: list[str]) -> Lang:
+    lang = Lang()
+    for text in ingredients:
+        lang.add_sentence(text)
+    for text in recipes:
+        lang.add_sentence(text)
+    return lang
+
+
 def summarise_tokens(tokens: list[list[int]]) -> tuple[int, int, float]:
     lengths = [len(x) for x in tokens]
     min_length = min(lengths)
@@ -208,20 +230,15 @@ def summarise_tokens(tokens: list[list[int]]) -> tuple[int, int, float]:
     return min_length, max_length, avg_length, stdev_length, median_length
 
 
-def indexes_from_text(lang: Lang, text: str):
-    return [lang.word2index[word] for word in text.split(" ")]
-
-
-def tensor_from_text(
+def indexes_from_text(
     lang: Lang, text: str, sos_token: bool = False, eos_token: bool = False
 ):
-    indexes = indexes_from_text(lang, text)
+    indexes = [lang.word2index[word] for word in text.split(" ")]
     if sos_token:
         indexes.insert(0, SOS_TOKEN)
     if eos_token:
         indexes.append(EOS_TOKEN)
-
-    return torch.tensor(indexes, dtype=torch.long, device=DEVICE)  # .view(-1, 1)
+    return indexes
 
 
 def remove_successive_chars(s: str, chars_to_keep_unchanged: set[str]):
@@ -327,7 +344,6 @@ def train(
     decoder_optimizer: Optimizer,
     criterion,
     writer: SummaryWriter,
-    learning_rate: float = 0.001,
 ):
     for i, (input_tensor, target_tensor) in enumerate(dataloader, 1):
         batch_size = input_tensor.shape[0]
@@ -374,6 +390,7 @@ def collate_fn(input_batch):
 
 
 dataset = CookingDataset("data/train")
+dataset.summarise()
 dataloader = DataLoader(dataset, 32, shuffle=True, collate_fn=collate_fn)
 
 hidden_size = 256
@@ -395,5 +412,4 @@ train(
     decoder_optimizer,
     criterion,
     writer,
-    learning_rate,
 )
