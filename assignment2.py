@@ -135,7 +135,7 @@ class Lang:
     def __init__(self):
         self.word2index = {}
         self.word2count = {}
-        self.index2word = {0: "SOS", 1: "EOS"}
+        self.index2word = {SOS_TOKEN: "SOS", EOS_TOKEN: "EOS"}
         self.n_words = 2  # Count SOS and EOS
 
     def add_sentence(self, sentence: str) -> None:
@@ -183,7 +183,6 @@ class DecoderRNN(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.gru = nn.GRU(hidden_size, hidden_size)
         self.out = nn.Linear(hidden_size, output_size)
-        self.softmax = nn.LogSoftmax(dim=1)
 
     def forward(self, target: PackedSequence, hidden):
         seq_unpacked, lens_unpacked = pad_packed_sequence(target, batch_first=True)
@@ -200,7 +199,7 @@ class DecoderRNN(nn.Module):
         seq_unpacked, lens_unpacked = pad_packed_sequence(output, batch_first=True)
 
         output = self.out(seq_unpacked)
-        output = self.softmax(output)
+        output = F.log_softmax(output, dim=2)
         output = pack_padded_sequence(
             output, lens_unpacked, batch_first=True, enforce_sorted=False
         )
@@ -242,6 +241,7 @@ class AttnDecoderRNN(nn.Module):
         out = self.out(features.view(-1, features.shape[-1])).view(
             features.shape[0], features.shape[1], -1
         )
+
         out = F.log_softmax(out, dim=2)
         out = pack_padded_sequence(
             out, decoder_output_lens_unpacked, batch_first=True, enforce_sorted=False
@@ -430,12 +430,7 @@ def train(
     writer: SummaryWriter,
 ):
     for i, (input_tensor, target_tensor) in enumerate(dataloader):
-        # batch_size = len(input_tensor)
-        # batch_size = input_tensor.shape[0]
         seq_to_seq.zero_grad()
-
-        # input_length = input_tensor.shape[-1]
-        # target_length = target_tensor.shape[-1]
 
         output = seq_to_seq.forward(input_tensor, target_tensor)
         loss = criterion(output, target_tensor)
@@ -463,11 +458,11 @@ dataloader = DataLoader(dataset, 32, shuffle=True, collate_fn=collate_fn)
 hidden_size = 256
 encoder = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
 
-# decoder = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
-# seq_to_seq = SeqToSeq(encoder, decoder)
+decoder = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
+seq_to_seq = SeqToSeq(encoder, decoder)
 
-decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
-seq_to_seq = SeqToSeqWithAttention(encoder, decoder)
+# decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
+# seq_to_seq = SeqToSeqWithAttention(encoder, decoder)
 
 writer = SummaryWriter()
 
