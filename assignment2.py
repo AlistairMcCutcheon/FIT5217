@@ -207,13 +207,13 @@ class DecoderRNN(nn.Module):
 
 
 class AttnDecoderRNN(nn.Module):
-    def __init__(self, hidden_size, output_size, dropout_p=0.1):
+    def __init__(self, hidden_size, output_size, attn: nn.Module, dropout_p=0.1):
         super(AttnDecoderRNN, self).__init__()
 
         self.embedding = nn.Embedding(output_size, hidden_size)
         self.dropout = nn.Dropout(dropout_p)
         self.gru = nn.GRU(hidden_size, hidden_size)
-        self.attn = DotProductAttention()
+        self.attn = attn
         self.out = nn.Linear(2 * hidden_size, output_size)
 
     def forward(self, input: PackedSequence, hidden, encoder_outputs: PackedSequence):
@@ -292,25 +292,44 @@ class DotProductAttention(nn.Module):
         return attn_out, attn_dist
 
 
-# class BahdanauAttention:
-#     def forward(
-#         self, key: PackedSequence, value: PackedSequence, query: PackedSequence
-#     ):
-#         query, lengths = pad_packed_sequence(query, batch_first=True)
-#         key, _ = pad_packed_sequence(key, batch_first=True)
-#         value, _ = pad_packed_sequence(value, batch_first=True)
+class BahdanauAttention(nn.Module):
+    def __init__(self, query_size) -> None:
+        super().__init__()
+        self.query_size = query_size
 
-#         attn_scores = torch.bmm(query, key.transpose(2, 1))
-#         attn_dist = F.softmax(attn_scores, dim=2)
-#         attn_out = torch.bmm(attn_dist, value)
+        self.key_linear = nn.Linear(query_size, query_size)
+        self.query_linear = nn.Linear(query_size, query_size)
 
-#         attn_out = pack_padded_sequence(
-#             attn_out, lengths, batch_first=True, enforce_sorted=False
-#         )
-#         attn_dist = pack_padded_sequence(
-#             attn_dist, lengths, batch_first=True, enforce_sorted=False
-#         )
-#         return attn_out, attn_dist
+        self.v_linear = nn.Linear(query_size, 1)
+
+    def forward(
+        self, key: PackedSequence, value: PackedSequence, query: PackedSequence
+    ):
+        query, lengths = pad_packed_sequence(query, batch_first=True)
+        key, _ = pad_packed_sequence(key, batch_first=True)
+        value, _ = pad_packed_sequence(value, batch_first=True)
+
+        embedded_key = self.key_linear(
+            key.view(key.shape[0] * key.shape[1], self.query_size)
+        ).view(key.shape[0], key.shape[1], self.query_size)
+
+        embedded_query = self.query_linear(
+            query.view(query.shape[0] * query.shape[1], self.query_size)
+        ).view(query.shape[0], query.shape[1], self.query_size)
+
+        x = F.tanh(embedded_key.unsqueeze(1) + embedded_query.unsqueeze(2))
+        attn_scores = self.v_linear(x.view(-1, self.query_size)).view(*x.shape[:3])
+
+        attn_dist = F.softmax(attn_scores, 2)
+        attn_out = torch.bmm(attn_dist, value)
+
+        attn_out = pack_padded_sequence(
+            attn_out, lengths, batch_first=True, enforce_sorted=False
+        )
+        attn_dist = pack_padded_sequence(
+            attn_dist, lengths, batch_first=True, enforce_sorted=False
+        )
+        return attn_out, attn_dist
 
 
 class SeqToSeq(nn.Module):
@@ -505,11 +524,16 @@ dataloader = DataLoader(dataset, 64, shuffle=True, collate_fn=collate_fn)
 hidden_size = 256
 encoder = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
 
-# decoder = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
-# seq_to_seq = SeqToSeq(encoder, decoder)
+decoder = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
+seq_to_seq = SeqToSeq(encoder, decoder).to(DEVICE)
 
-decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
-seq_to_seq = SeqToSeqWithAttention(encoder, decoder)
+decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words, BahdanauAttention(256)).to(
+    DEVICE
+)
+# decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words, DotProductAttention()).to(
+#     DEVICE
+# )
+seq_to_seq = SeqToSeqWithAttention(encoder, decoder).to(DEVICE)
 
 writer = SummaryWriter()
 
