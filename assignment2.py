@@ -67,7 +67,7 @@ class CookingDataset(Dataset):
         return ingredients_tensor, recepe_tensor
 
     def __len__(self):
-        return len(self.ingredients)
+        return len(self.tokenised_ingredients)
 
     def summarise(self):
         ingredients_alphabet = get_alphabet(self.ingredients)
@@ -182,7 +182,7 @@ class DecoderRNN(nn.Module):
         self.embedding = nn.Embedding(output_size, hidden_size)
         self.dropout = nn.Dropout(dropout)
         self.gru = nn.GRU(hidden_size, hidden_size)
-        self.out = nn.Linear(hidden_size, output_size)
+        # self.out = nn.Linear(hidden_size, output_size)
 
     def forward(self, target: PackedSequence, hidden):
         seq_unpacked, lens_unpacked = pad_packed_sequence(target, batch_first=True)
@@ -196,14 +196,20 @@ class DecoderRNN(nn.Module):
 
         output, hidden = self.gru(output, hidden)
 
-        seq_unpacked, lens_unpacked = pad_packed_sequence(output, batch_first=True)
-
-        output = self.out(seq_unpacked)
-        output = F.log_softmax(output, dim=2)
-        output = pack_padded_sequence(
-            output, lens_unpacked, batch_first=True, enforce_sorted=False
-        )
         return output, hidden
+
+
+class Head(nn.Module):
+    def __init__(self, input_size, output_size) -> None:
+        super().__init__()
+        self.out = nn.Linear(input_size, output_size)
+
+    def forward(self, x: PackedSequence):
+        x, x_lens = pad_packed_sequence(x, batch_first=True)
+        x = self.out(x)
+        x = F.log_softmax(x, dim=2)
+        x = pack_padded_sequence(x, x_lens, batch_first=True, enforce_sorted=False)
+        return x
 
 
 class AttnDecoderRNN(nn.Module):
@@ -237,6 +243,7 @@ class AttnDecoderRNN(nn.Module):
         )
 
         features = torch.cat((attn_out, decoder_out), dim=2)
+
         out = self.out(features.view(-1, features.shape[-1])).view(
             features.shape[0], features.shape[1], -1
         )
@@ -247,6 +254,23 @@ class AttnDecoderRNN(nn.Module):
         )
 
         return out, hidden, attn_dist
+
+
+class PointerGen(nn.Module):
+    def __init__(self, decoder: AttnDecoderRNN, hidden_size) -> None:
+        super().__init__()
+        self.decoder = decoder
+        self.attn_linear = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, input: PackedSequence, hidden, encoder_outputs: PackedSequence):
+        decoder_output, _, attn_dist = self.decoder(input, hidden, encoder_outputs)
+
+        decoder_output, lengths = pad_packed_sequence(decoder_output, batch_first=True)
+        print(decoder_output.shape)
+        attn_dist, _ = pad_packed_sequence(attn_dist, batch_first=True)
+        print(attn_dist.shape)
+        encoder_outputs, _ = pad_packed_sequence(encoder_outputs, batch_first=True)
+        print(encoder_outputs.shape)
 
 
 class SequenceNLLLoss(nn.Module):
@@ -333,15 +357,17 @@ class BahdanauAttention(nn.Module):
 
 
 class SeqToSeq(nn.Module):
-    def __init__(self, encoder: EncoderRNN, decoder: DecoderRNN) -> None:
+    def __init__(self, encoder: EncoderRNN, decoder: DecoderRNN, head: Head) -> None:
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.head = head
 
     def forward(self, input, target):
         _, encoder_hidden = encoder(input)
         decoder_output, _ = decoder(target, encoder_hidden)
-        return decoder_output
+        output = self.head(decoder_output)
+        return output
 
 
 class SeqToSeqWithAttention(nn.Module):
@@ -354,10 +380,6 @@ class SeqToSeqWithAttention(nn.Module):
         encoder_outputs, encoder_hidden = encoder(input)
         decoder_output, _, _ = decoder(target, encoder_hidden, encoder_outputs)
         return decoder_output
-
-
-class GetToThePoint(nn.Module):
-    pass
 
 
 def create_lang(ingredients: list[str], recipes: list[str]) -> Lang:
@@ -473,9 +495,9 @@ def read_ingredients_recepies(data_dir_path: str):
             for ingredients, recepie in read_ingredient_recipe(file):
                 ingredients_per_recepie.append(normalise_string(ingredients))
                 recepies.append(normalise_string(recepie))
-        # if i >= 5:
-        #     break
-        # i += 1
+        if i >= 5:
+            break
+        i += 1
     return ingredients_per_recepie, recepies
 
 
@@ -525,15 +547,21 @@ hidden_size = 256
 encoder = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
 
 decoder = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
-seq_to_seq = SeqToSeq(encoder, decoder).to(DEVICE)
+head = Head(hidden_size, dataset.lang.n_words)
+seq_to_seq = SeqToSeq(encoder, decoder, head).to(DEVICE)
 
-decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words, BahdanauAttention(256)).to(
-    DEVICE
-)
+# decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words, BahdanauAttention(256)).to(
+#     DEVICE
+# )
 # decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words, DotProductAttention()).to(
 #     DEVICE
 # )
-seq_to_seq = SeqToSeqWithAttention(encoder, decoder).to(DEVICE)
+
+# decoder = PointerGen(
+#     AttnDecoderRNN(hidden_size, dataset.lang.n_words, BahdanauAttention(256)), 256
+# ).to(DEVICE)
+
+# seq_to_seq = SeqToSeqWithAttention(encoder, decoder).to(DEVICE)
 
 writer = SummaryWriter()
 
@@ -547,4 +575,13 @@ train(
     optimiser,
     criterion,
     writer,
+)
+
+test_text = "10 oz chopped broccoli, 2 tbsp butter, 2 tbsp flour, 1/2 tsp salt, 1/4 tsp black pepper, 1/4 tsp ground nutmeg, 1 cup milk, 1 1/2 cup shredded swiss cheese, 2 tsp lemon juice, 2 cup cooked cubed turkey, 4 oz mushrooms, 1/4 cup grated Parmesan cheese, 1 can refrigerated biscuits"
+input = pack_sequence(
+    torch.tensor(
+        [indexes_from_text(dataset.lang, test_text, SOS_TOKEN=False, EOS_TOKEN=True)],
+        dtype=torch.long,
+        device=DEVICE,
+    )
 )
