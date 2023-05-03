@@ -213,7 +213,8 @@ class AttnDecoderRNN(nn.Module):
         self.embedding = nn.Embedding(output_size, hidden_size)
         self.dropout = nn.Dropout(dropout_p)
         self.gru = nn.GRU(hidden_size, hidden_size)
-        self.out = nn.Linear(hidden_size * 2, output_size)
+        self.attn = DotProductAttention()
+        self.out = nn.Linear(2 * hidden_size, output_size)
 
     def forward(self, input: PackedSequence, hidden, encoder_outputs: PackedSequence):
         seq_unpacked, lens_unpacked = pad_packed_sequence(input, batch_first=True)
@@ -226,28 +227,26 @@ class AttnDecoderRNN(nn.Module):
         )
 
         decoder_output, _ = self.gru(embedded, hidden)
-        decoder_output_unpacked, decoder_output_lens_unpacked = pad_packed_sequence(
+
+        attn_out, attn_dist = self.attn(
+            key=encoder_outputs, value=encoder_outputs, query=decoder_output
+        )
+        attn_out, _ = pad_packed_sequence(attn_out, batch_first=True)
+        decoder_out, decoder_lens = pad_packed_sequence(
             decoder_output, batch_first=True
         )
-        encoder_out_unpacked, _ = pad_packed_sequence(encoder_outputs, batch_first=True)
 
-        attention_scores = torch.bmm(
-            decoder_output_unpacked, encoder_out_unpacked.transpose(2, 1)
-        )
-        attention_distribution = F.softmax(attention_scores, dim=2)
-        attention_output = torch.bmm(attention_distribution, encoder_out_unpacked)
-
-        features = torch.cat((attention_output, decoder_output_unpacked), dim=2)
+        features = torch.cat((attn_out, decoder_out), dim=2)
         out = self.out(features.view(-1, features.shape[-1])).view(
             features.shape[0], features.shape[1], -1
         )
 
         out = F.log_softmax(out, dim=2)
         out = pack_padded_sequence(
-            out, decoder_output_lens_unpacked, batch_first=True, enforce_sorted=False
+            out, decoder_lens, batch_first=True, enforce_sorted=False
         )
 
-        return out, hidden, attention_scores
+        return out, hidden, attn_dist
 
 
 class SequenceNLLLoss(nn.Module):
@@ -272,6 +271,48 @@ class SequenceNLLLoss(nn.Module):
         return loss / len(input_seq_unpacked)
 
 
+class DotProductAttention(nn.Module):
+    def forward(
+        self, key: PackedSequence, value: PackedSequence, query: PackedSequence
+    ):
+        query, lengths = pad_packed_sequence(query, batch_first=True)
+        key, _ = pad_packed_sequence(key, batch_first=True)
+        value, _ = pad_packed_sequence(value, batch_first=True)
+
+        attn_scores = torch.bmm(query, key.transpose(2, 1))
+        attn_dist = F.softmax(attn_scores, dim=2)
+        attn_out = torch.bmm(attn_dist, value)
+
+        attn_out = pack_padded_sequence(
+            attn_out, lengths, batch_first=True, enforce_sorted=False
+        )
+        attn_dist = pack_padded_sequence(
+            attn_dist, lengths, batch_first=True, enforce_sorted=False
+        )
+        return attn_out, attn_dist
+
+
+# class BahdanauAttention:
+#     def forward(
+#         self, key: PackedSequence, value: PackedSequence, query: PackedSequence
+#     ):
+#         query, lengths = pad_packed_sequence(query, batch_first=True)
+#         key, _ = pad_packed_sequence(key, batch_first=True)
+#         value, _ = pad_packed_sequence(value, batch_first=True)
+
+#         attn_scores = torch.bmm(query, key.transpose(2, 1))
+#         attn_dist = F.softmax(attn_scores, dim=2)
+#         attn_out = torch.bmm(attn_dist, value)
+
+#         attn_out = pack_padded_sequence(
+#             attn_out, lengths, batch_first=True, enforce_sorted=False
+#         )
+#         attn_dist = pack_padded_sequence(
+#             attn_dist, lengths, batch_first=True, enforce_sorted=False
+#         )
+#         return attn_out, attn_dist
+
+
 class SeqToSeq(nn.Module):
     def __init__(self, encoder: EncoderRNN, decoder: DecoderRNN) -> None:
         super().__init__()
@@ -294,6 +335,10 @@ class SeqToSeqWithAttention(nn.Module):
         encoder_outputs, encoder_hidden = encoder(input)
         decoder_output, _, _ = decoder(target, encoder_hidden, encoder_outputs)
         return decoder_output
+
+
+class GetToThePoint(nn.Module):
+    pass
 
 
 def create_lang(ingredients: list[str], recipes: list[str]) -> Lang:
@@ -403,7 +448,7 @@ def read_next_recepie(text_lines: Iterable[str]) -> str:
 def read_ingredients_recepies(data_dir_path: str):
     ingredients_per_recepie = []
     recepies = []
-    # i = 0
+    i = 0
     for recipes_file_path in Path(data_dir_path).glob("*"):
         with open(recipes_file_path, "r") as file:
             for ingredients, recepie in read_ingredient_recipe(file):
