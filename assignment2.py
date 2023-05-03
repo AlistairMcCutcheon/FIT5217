@@ -152,6 +152,12 @@ class Lang:
         self.index2word[self.n_words] = word
         self.n_words += 1
 
+    def create_index_to_prob(self):
+        index_to_count = torch.zeros((self.n_words,), requires_grad=False)
+        for index, word in self.index2word.items():
+            index_to_count[index] = self.word2count[word]
+        return index_to_count / torch.sum(index_to_count)
+
 
 class EncoderRNN(nn.Module):
     def __init__(self, input_size, hidden_size):
@@ -161,42 +167,36 @@ class EncoderRNN(nn.Module):
         self.embedding = nn.Embedding(input_size, hidden_size)
         self.gru = nn.GRU(hidden_size, hidden_size)
 
-    def forward(self, input: PackedSequence):
-        seq_unpacked, lens_unpacked = pad_packed_sequence(input, batch_first=True)
-        batch_size = len(seq_unpacked)
-        embedded = self.embedding(seq_unpacked)
-        embedded = pack_padded_sequence(
-            embedded, lens_unpacked, batch_first=True, enforce_sorted=False
-        )
-
-        hidden_0 = torch.zeros((1, batch_size, self.hidden_size), device=DEVICE)
-        output, hidden = self.gru(embedded, hidden_0)
+    def forward(self, x: PackedSequence):
+        hidden_0 = torch.zeros((1, x.batch_sizes[0], self.hidden_size), device=DEVICE)
+        output, hidden = self.gru(x, hidden_0)
         return output, hidden
 
 
 class DecoderRNN(nn.Module):
-    def __init__(self, hidden_size, output_size, dropout=0.1):
+    def __init__(self, hidden_size, output_size):
         super(DecoderRNN, self).__init__()
         self.hidden_size = hidden_size
         self.output_size = output_size
-        self.embedding = nn.Embedding(output_size, hidden_size)
-        self.dropout = nn.Dropout(dropout)
         self.gru = nn.GRU(hidden_size, hidden_size)
-        # self.out = nn.Linear(hidden_size, output_size)
 
     def forward(self, target: PackedSequence, hidden):
-        seq_unpacked, lens_unpacked = pad_packed_sequence(target, batch_first=True)
-        embedded = self.embedding(seq_unpacked)
+        return self.gru(target, hidden)
 
-        output = self.dropout(embedded)
-        output = F.relu(embedded)
-        output = pack_padded_sequence(
-            output, lens_unpacked, batch_first=True, enforce_sorted=False
-        )
 
-        output, hidden = self.gru(output, hidden)
+class Embedding(nn.Module):
+    def __init__(self, input_size, hidden_size, dropout=0.1) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(input_size, hidden_size)
+        self.dropout = nn.Dropout(dropout)
 
-        return output, hidden
+    def forward(self, x: PackedSequence):
+        x, x_lens = pad_packed_sequence(x, batch_first=True)
+        x = self.embedding(x)
+        x = self.dropout(x)
+        x = F.relu(x)
+        x = pack_padded_sequence(x, x_lens, batch_first=True, enforce_sorted=False)
+        return x
 
 
 class Head(nn.Module):
@@ -213,26 +213,13 @@ class Head(nn.Module):
 
 
 class AttnDecoderRNN(nn.Module):
-    def __init__(self, hidden_size, output_size, attn: nn.Module, dropout_p=0.1):
+    def __init__(self, hidden_size, attn: nn.Module):
         super(AttnDecoderRNN, self).__init__()
-
-        self.embedding = nn.Embedding(output_size, hidden_size)
-        self.dropout = nn.Dropout(dropout_p)
         self.gru = nn.GRU(hidden_size, hidden_size)
         self.attn = attn
-        self.out = nn.Linear(2 * hidden_size, output_size)
 
-    def forward(self, input: PackedSequence, hidden, encoder_outputs: PackedSequence):
-        seq_unpacked, lens_unpacked = pad_packed_sequence(input, batch_first=True)
-        embedded = self.embedding(seq_unpacked)
-        embedded = F.relu(embedded)
-        embedded = self.dropout(embedded)
-
-        embedded = pack_padded_sequence(
-            embedded, lens_unpacked, batch_first=True, enforce_sorted=False
-        )
-
-        decoder_output, _ = self.gru(embedded, hidden)
+    def forward(self, x: PackedSequence, hidden, encoder_outputs: PackedSequence):
+        decoder_output, _ = self.gru(x, hidden)
 
         attn_out, attn_dist = self.attn(
             key=encoder_outputs, value=encoder_outputs, query=decoder_output
@@ -241,20 +228,45 @@ class AttnDecoderRNN(nn.Module):
 
 
 class PointerGen(nn.Module):
-    def __init__(self, decoder: AttnDecoderRNN, hidden_size) -> None:
+    def __init__(self, hidden_size) -> None:
         super().__init__()
-        self.decoder = decoder
-        self.attn_linear = nn.Linear(hidden_size, hidden_size)
+        self.context_linear = nn.Linear(hidden_size, 1)
+        self.decoder_out_linear = nn.Linear(hidden_size, 1)
+        self.decoder_input_linear = nn.Linear(hidden_size, 1)
 
-    def forward(self, input: PackedSequence, hidden, encoder_outputs: PackedSequence):
-        decoder_output, _, attn_dist = self.decoder(input, hidden, encoder_outputs)
-
-        decoder_output, lengths = pad_packed_sequence(decoder_output, batch_first=True)
-        print(decoder_output.shape)
+    def forward(
+        self,
+        input_tokens: PackedSequence,
+        context: PackedSequence,
+        decoder_input: PackedSequence,
+        decoder_output: PackedSequence,
+        vocab_dist: PackedSequence,
+        attn_dist: PackedSequence,
+        encoder_outputs: PackedSequence,
+    ):
+        input_tokens, _ = pad_packed_sequence(input_tokens, batch_first=True)
+        decoder_input, _ = pad_packed_sequence(decoder_input, batch_first=True)
+        decoder_output, _ = pad_packed_sequence(decoder_output, batch_first=True)
+        context, _ = pad_packed_sequence(context, batch_first=True)
+        vocab_dist, lengths = pad_packed_sequence(vocab_dist, batch_first=True)
         attn_dist, _ = pad_packed_sequence(attn_dist, batch_first=True)
-        print(attn_dist.shape)
         encoder_outputs, _ = pad_packed_sequence(encoder_outputs, batch_first=True)
-        print(encoder_outputs.shape)
+        p_gen = F.sigmoid(
+            self.context_linear(context)
+            + self.decoder_out_linear(decoder_output)
+            + self.decoder_input_linear(decoder_input)
+        )
+        copy_dist = torch.scatter_add(
+            input=torch.zeros_like(vocab_dist),
+            dim=2,
+            index=input_tokens.unsqueeze(1).expand(attn_dist.shape),
+            src=attn_dist,
+        )
+        final_dist = vocab_dist * p_gen + (1 - p_gen) * copy_dist
+
+        return pack_padded_sequence(
+            final_dist, lengths, batch_first=True, enforce_sorted=False
+        )
 
 
 class SequenceNLLLoss(nn.Module):
@@ -341,39 +353,103 @@ class BahdanauAttention(nn.Module):
 
 
 class SeqToSeq(nn.Module):
-    def __init__(self, encoder: EncoderRNN, decoder: DecoderRNN, head: Head) -> None:
+    def __init__(
+        self,
+        encoder: EncoderRNN,
+        decoder: DecoderRNN,
+        encoder_embedding: Embedding,
+        decoder_embedding,
+        head: Head,
+    ) -> None:
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.encoder_embedding = encoder_embedding
+        self.decoder_embedding = decoder_embedding
         self.head = head
 
-    def forward(self, input, target):
-        _, encoder_hidden = encoder(input)
+    def forward(self, x, target):
+        x = self.encoder_embedding(x)
+        _, encoder_hidden = encoder(x)
+
+        target = self.decoder_embedding(target)
         decoder_output, _ = decoder(target, encoder_hidden)
+
         return self.head(decoder_output)
 
 
 class SeqToSeqWithAttention(nn.Module):
     def __init__(
-        self, encoder: EncoderRNN, decoder: AttnDecoderRNN, head: Head
+        self,
+        encoder: EncoderRNN,
+        decoder: AttnDecoderRNN,
+        encoder_embedding: Embedding,
+        decoder_embedding: Embedding,
+        head: Head,
     ) -> None:
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.encoder_embedding = encoder_embedding
+        self.decoder_embedding = decoder_embedding
         self.head = head
 
-    def forward(self, input, target):
-        encoder_outputs, encoder_hidden = encoder(input)
-        attn_out, decoder_output, _ = decoder(target, encoder_hidden, encoder_outputs)
+    def forward(self, x, target):
+        x = self.encoder_embedding(x)
+        encoder_outputs, encoder_hidden = encoder(x)
 
-        attn_out, _ = pad_packed_sequence(attn_out, batch_first=True)
-        decoder_out, lens = pad_packed_sequence(decoder_output, batch_first=True)
-        features = torch.cat((attn_out, decoder_out), dim=2)
-        features = pack_padded_sequence(
-            features, lens, batch_first=True, enforce_sorted=False
-        )
+        target = self.decoder_embedding(target)
+        attn_out, decoder_output, _ = decoder(target, encoder_hidden, encoder_outputs)
+        features = concat_packed_sequences(attn_out, decoder_output)
 
         return self.head(features)
+
+
+class GetToThePoint(nn.Module):
+    def __init__(
+        self,
+        encoder: EncoderRNN,
+        decoder: AttnDecoderRNN,
+        encoder_embedding: Embedding,
+        decoder_embedding: Embedding,
+        head: Head,
+        pointer_gen: PointerGen,
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.encoder_embedding = encoder_embedding
+        self.decoder_embedding = decoder_embedding
+        self.head = head
+        self.pointer_gen = pointer_gen
+
+    def forward(self, x, target):
+        embedded = self.encoder_embedding(x)
+        encoder_outputs, encoder_hidden = encoder(embedded)
+
+        target = self.decoder_embedding(target)
+        attn_out, decoder_output, attn_dist = decoder(
+            target, encoder_hidden, encoder_outputs
+        )
+        features = concat_packed_sequences(attn_out, decoder_output)
+        vocab_dist = self.head(features)
+        final_dist = self.pointer_gen(
+            input_tokens=x,
+            context=attn_out,
+            decoder_input=target,
+            decoder_output=decoder_output,
+            vocab_dist=vocab_dist,
+            attn_dist=attn_dist,
+            encoder_outputs=encoder_outputs,
+        )
+        return final_dist
+
+
+def concat_packed_sequences(seq1: PackedSequence, seq2: PackedSequence):
+    seq1, _ = pad_packed_sequence(seq1, batch_first=True)
+    seq2, lens = pad_packed_sequence(seq2, batch_first=True)
+    out = torch.cat((seq1, seq2), dim=2)
+    return pack_padded_sequence(out, lens, batch_first=True, enforce_sorted=False)
 
 
 def create_lang(ingredients: list[str], recipes: list[str]) -> Lang:
@@ -538,24 +614,32 @@ dataset.summarise()
 dataloader = DataLoader(dataset, 64, shuffle=True, collate_fn=collate_fn)
 
 hidden_size = 256
+
+encoder_embedding = Embedding(dataset.lang.n_words, hidden_size).to(DEVICE)
+decoder_embedding = Embedding(dataset.lang.n_words, hidden_size).to(DEVICE)
 encoder = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
 
-# decoder = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
+# decoder = DecoderRNN(hidden_size).to(DEVICE)
 # head = Head(hidden_size, dataset.lang.n_words)
-# seq_to_seq = SeqToSeq(encoder, decoder, head).to(DEVICE)
-
-decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words, BahdanauAttention(256)).to(
-    DEVICE
-)
-# decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words, DotProductAttention()).to(
+# seq_to_seq = SeqToSeq(encoder, decoder, encoder_embedding, decoder_embedding, head).to(
 #     DEVICE
 # )
 
-# decoder = PointerGen(
-#     AttnDecoderRNN(hidden_size, dataset.lang.n_words, BahdanauAttention(256)), 256
-# ).to(DEVICE)
+# decoder = AttnDecoderRNN(hidden_size, BahdanauAttention(256)).to(
+#     DEVICE
+# )
+# decoder = AttnDecoderRNN(hidden_size, DotProductAttention()).to(DEVICE)
+
+decoder = AttnDecoderRNN(hidden_size, BahdanauAttention(256)).to(DEVICE)
 head = Head(2 * hidden_size, dataset.lang.n_words)
-seq_to_seq = SeqToSeqWithAttention(encoder, decoder, head).to(DEVICE)
+# seq_to_seq = SeqToSeqWithAttention(
+#     encoder, decoder, encoder_embedding, decoder_embedding, head
+# ).to(DEVICE)
+
+pointer_gen = PointerGen(hidden_size).to(DEVICE)
+seq_to_seq = GetToThePoint(
+    encoder, decoder, encoder_embedding, decoder_embedding, head, pointer_gen
+).to(DEVICE)
 
 writer = SummaryWriter()
 
