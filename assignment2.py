@@ -262,8 +262,7 @@ class PointerGen(nn.Module):
             index=input_tokens.unsqueeze(1).expand(attn_dist.shape),
             src=attn_dist,
         )
-        final_dist = vocab_dist * p_gen + (1 - p_gen) * copy_dist
-
+        final_dist = vocab_dist * p_gen + (1 - p_gen) * F.log_softmax(copy_dist)
         return pack_padded_sequence(
             final_dist, lengths, batch_first=True, enforce_sorted=False
         )
@@ -443,7 +442,7 @@ class GetToThePoint(nn.Module):
             encoder_outputs=encoder_outputs,
         )
 
-        return self.head(final_dist)
+        return final_dist
 
 
 def concat_packed_sequences(seq1: PackedSequence, seq2: PackedSequence):
@@ -612,7 +611,7 @@ def collate_fn(input_batch):
 
 dataset = CookingDataset("data/train")
 dataset.summarise()
-dataloader = DataLoader(dataset, 64, shuffle=True, collate_fn=collate_fn)
+dataloader = DataLoader(dataset, 32, shuffle=True, collate_fn=collate_fn)
 
 hidden_size = 256
 
