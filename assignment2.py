@@ -442,7 +442,8 @@ class GetToThePoint(nn.Module):
             attn_dist=attn_dist,
             encoder_outputs=encoder_outputs,
         )
-        return final_dist
+
+        return self.head(final_dist)
 
 
 def concat_packed_sequences(seq1: PackedSequence, seq2: PackedSequence):
@@ -565,9 +566,9 @@ def read_ingredients_recepies(data_dir_path: str):
             for ingredients, recepie in read_ingredient_recipe(file):
                 ingredients_per_recepie.append(normalise_string(ingredients))
                 recepies.append(normalise_string(recepie))
-        if i >= 5:
-            break
-        i += 1
+        # if i >= 5:
+        #     break
+        # i += 1
     return ingredients_per_recepie, recepies
 
 
