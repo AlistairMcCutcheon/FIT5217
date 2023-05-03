@@ -237,23 +237,7 @@ class AttnDecoderRNN(nn.Module):
         attn_out, attn_dist = self.attn(
             key=encoder_outputs, value=encoder_outputs, query=decoder_output
         )
-        attn_out, _ = pad_packed_sequence(attn_out, batch_first=True)
-        decoder_out, decoder_lens = pad_packed_sequence(
-            decoder_output, batch_first=True
-        )
-
-        features = torch.cat((attn_out, decoder_out), dim=2)
-
-        out = self.out(features.view(-1, features.shape[-1])).view(
-            features.shape[0], features.shape[1], -1
-        )
-
-        out = F.log_softmax(out, dim=2)
-        out = pack_padded_sequence(
-            out, decoder_lens, batch_first=True, enforce_sorted=False
-        )
-
-        return out, hidden, attn_dist
+        return attn_out, decoder_output, attn_dist
 
 
 class PointerGen(nn.Module):
@@ -366,20 +350,30 @@ class SeqToSeq(nn.Module):
     def forward(self, input, target):
         _, encoder_hidden = encoder(input)
         decoder_output, _ = decoder(target, encoder_hidden)
-        output = self.head(decoder_output)
-        return output
+        return self.head(decoder_output)
 
 
 class SeqToSeqWithAttention(nn.Module):
-    def __init__(self, encoder: EncoderRNN, decoder: AttnDecoderRNN) -> None:
+    def __init__(
+        self, encoder: EncoderRNN, decoder: AttnDecoderRNN, head: Head
+    ) -> None:
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.head = head
 
     def forward(self, input, target):
         encoder_outputs, encoder_hidden = encoder(input)
-        decoder_output, _, _ = decoder(target, encoder_hidden, encoder_outputs)
-        return decoder_output
+        attn_out, decoder_output, _ = decoder(target, encoder_hidden, encoder_outputs)
+
+        attn_out, _ = pad_packed_sequence(attn_out, batch_first=True)
+        decoder_out, lens = pad_packed_sequence(decoder_output, batch_first=True)
+        features = torch.cat((attn_out, decoder_out), dim=2)
+        features = pack_padded_sequence(
+            features, lens, batch_first=True, enforce_sorted=False
+        )
+
+        return self.head(features)
 
 
 def create_lang(ingredients: list[str], recipes: list[str]) -> Lang:
@@ -546,13 +540,13 @@ dataloader = DataLoader(dataset, 64, shuffle=True, collate_fn=collate_fn)
 hidden_size = 256
 encoder = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
 
-decoder = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
-head = Head(hidden_size, dataset.lang.n_words)
-seq_to_seq = SeqToSeq(encoder, decoder, head).to(DEVICE)
+# decoder = DecoderRNN(hidden_size, dataset.lang.n_words).to(DEVICE)
+# head = Head(hidden_size, dataset.lang.n_words)
+# seq_to_seq = SeqToSeq(encoder, decoder, head).to(DEVICE)
 
-# decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words, BahdanauAttention(256)).to(
-#     DEVICE
-# )
+decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words, BahdanauAttention(256)).to(
+    DEVICE
+)
 # decoder = AttnDecoderRNN(hidden_size, dataset.lang.n_words, DotProductAttention()).to(
 #     DEVICE
 # )
@@ -560,8 +554,8 @@ seq_to_seq = SeqToSeq(encoder, decoder, head).to(DEVICE)
 # decoder = PointerGen(
 #     AttnDecoderRNN(hidden_size, dataset.lang.n_words, BahdanauAttention(256)), 256
 # ).to(DEVICE)
-
-# seq_to_seq = SeqToSeqWithAttention(encoder, decoder).to(DEVICE)
+head = Head(2 * hidden_size, dataset.lang.n_words)
+seq_to_seq = SeqToSeqWithAttention(encoder, decoder, head).to(DEVICE)
 
 writer = SummaryWriter()
 
