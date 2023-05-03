@@ -27,6 +27,7 @@ import numpy as np
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SOS_TOKEN = 0
 EOS_TOKEN = 1
+UNK_TOKEN = 2
 
 
 class CookingDataset(Dataset):
@@ -135,8 +136,8 @@ class Lang:
     def __init__(self):
         self.word2index = {}
         self.word2count = {}
-        self.index2word = {SOS_TOKEN: "SOS", EOS_TOKEN: "EOS"}
-        self.n_words = 2  # Count SOS and EOS
+        self.index2word = {SOS_TOKEN: "SOS", EOS_TOKEN: "EOS", UNK_TOKEN: "UNK"}
+        self.n_words = 3  # Count SOS and EOS
 
     def add_sentence(self, sentence: str) -> None:
         for word in sentence.split(" "):
@@ -151,6 +152,20 @@ class Lang:
         self.word2count[word] = 1
         self.index2word[self.n_words] = word
         self.n_words += 1
+
+    # def get_index(self, word: str):
+    #     try:
+    #         return self.word2index[word]
+    #     except KeyError:
+    #         return self.word2index["UNK"]
+
+    # def get_count(self, word: str):
+    #     try:
+    #         return self.word2count[word]
+    #     except KeyError:
+    #         return self.word2count["UNK"]
+
+    # def get_
 
     def create_index_to_prob(self):
         index_to_count = torch.zeros((self.n_words,), requires_grad=False)
@@ -174,10 +189,9 @@ class EncoderRNN(nn.Module):
 
 
 class DecoderRNN(nn.Module):
-    def __init__(self, hidden_size, output_size):
+    def __init__(self, hidden_size):
         super(DecoderRNN, self).__init__()
         self.hidden_size = hidden_size
-        self.output_size = output_size
         self.gru = nn.GRU(hidden_size, hidden_size)
 
     def forward(self, target: PackedSequence, hidden):
@@ -565,9 +579,9 @@ def read_ingredients_recepies(data_dir_path: str):
             for ingredients, recepie in read_ingredient_recipe(file):
                 ingredients_per_recepie.append(normalise_string(ingredients))
                 recepies.append(normalise_string(recepie))
-        # if i >= 5:
-        #     break
-        # i += 1
+        if i >= 5:
+            break
+        i += 1
     return ingredients_per_recepie, recepies
 
 
@@ -619,27 +633,27 @@ encoder_embedding = Embedding(dataset.lang.n_words, hidden_size).to(DEVICE)
 decoder_embedding = Embedding(dataset.lang.n_words, hidden_size).to(DEVICE)
 encoder = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
 
-# decoder = DecoderRNN(hidden_size).to(DEVICE)
-# head = Head(hidden_size, dataset.lang.n_words)
-# seq_to_seq = SeqToSeq(encoder, decoder, encoder_embedding, decoder_embedding, head).to(
-#     DEVICE
-# )
+decoder = DecoderRNN(hidden_size).to(DEVICE)
+head = Head(hidden_size, dataset.lang.n_words)
+seq_to_seq = SeqToSeq(encoder, decoder, encoder_embedding, decoder_embedding, head).to(
+    DEVICE
+)
 
 # decoder = AttnDecoderRNN(hidden_size, BahdanauAttention(256)).to(
 #     DEVICE
 # )
 # decoder = AttnDecoderRNN(hidden_size, DotProductAttention()).to(DEVICE)
 
-decoder = AttnDecoderRNN(hidden_size, BahdanauAttention(256)).to(DEVICE)
-head = Head(2 * hidden_size, dataset.lang.n_words)
+# decoder = AttnDecoderRNN(hidden_size, BahdanauAttention(256)).to(DEVICE)
+# head = Head(2 * hidden_size, dataset.lang.n_words)
 # seq_to_seq = SeqToSeqWithAttention(
 #     encoder, decoder, encoder_embedding, decoder_embedding, head
 # ).to(DEVICE)
 
-pointer_gen = PointerGen(hidden_size).to(DEVICE)
-seq_to_seq = GetToThePoint(
-    encoder, decoder, encoder_embedding, decoder_embedding, head, pointer_gen
-).to(DEVICE)
+# pointer_gen = PointerGen(hidden_size).to(DEVICE)
+# seq_to_seq = GetToThePoint(
+#     encoder, decoder, encoder_embedding, decoder_embedding, head, pointer_gen
+# ).to(DEVICE)
 
 writer = SummaryWriter()
 
@@ -647,19 +661,30 @@ learning_rate = 0.001
 optimiser = optim.Adam(seq_to_seq.parameters(), lr=learning_rate)
 criterion = SequenceNLLLoss()
 
-train(
-    dataloader,
-    seq_to_seq,
-    optimiser,
-    criterion,
-    writer,
-)
+# train(
+#     dataloader,
+#     seq_to_seq,
+#     optimiser,
+#     criterion,
+#     writer,
+# )
 
 test_text = "10 oz chopped broccoli, 2 tbsp butter, 2 tbsp flour, 1/2 tsp salt, 1/4 tsp black pepper, 1/4 tsp ground nutmeg, 1 cup milk, 1 1/2 cup shredded swiss cheese, 2 tsp lemon juice, 2 cup cooked cubed turkey, 4 oz mushrooms, 1/4 cup grated Parmesan cheese, 1 can refrigerated biscuits"
 input = pack_sequence(
-    torch.tensor(
-        [indexes_from_text(dataset.lang, test_text, SOS_TOKEN=False, EOS_TOKEN=True)],
-        dtype=torch.long,
-        device=DEVICE,
-    )
+    [
+        torch.tensor(
+            indexes_from_text(dataset.lang, test_text, sos_token=False, eos_token=True),
+            dtype=torch.long,
+            device=DEVICE,
+        )
+    ]
 )
+
+
+def sequential_forward_pass(input: PackedSequence, model):
+    input = pad_packed_sequence(input, batch_first=True)
+    for timestep in input.shape[1]:
+        print(input[:, timestep, :])
+
+
+sequential_forward_pass(input, seq_to_seq)
