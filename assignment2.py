@@ -136,8 +136,11 @@ class Lang:
     def __init__(self):
         self.word2index = {}
         self.word2count = {}
-        self.index2word = {SOS_TOKEN: "SOS", EOS_TOKEN: "EOS", UNK_TOKEN: "UNK"}
-        self.n_words = 3  # Count SOS and EOS
+        self.index2word = {}
+        self.n_words = 0  # Count SOS and EOS
+        self.addWord("SOS")
+        self.addWord("EOS")
+        self.addWord("UNK")
 
     def add_sentence(self, sentence: str) -> None:
         for word in sentence.split(" "):
@@ -153,19 +156,11 @@ class Lang:
         self.index2word[self.n_words] = word
         self.n_words += 1
 
-    # def get_index(self, word: str):
-    #     try:
-    #         return self.word2index[word]
-    #     except KeyError:
-    #         return self.word2index["UNK"]
-
-    # def get_count(self, word: str):
-    #     try:
-    #         return self.word2count[word]
-    #     except KeyError:
-    #         return self.word2count["UNK"]
-
-    # def get_
+    def get_index(self, word: str):
+        try:
+            return self.word2index[word]
+        except KeyError:
+            return self.word2index["UNK"]
 
     def create_index_to_prob(self):
         index_to_count = torch.zeros((self.n_words,), requires_grad=False)
@@ -342,13 +337,8 @@ class BahdanauAttention(nn.Module):
         key, _ = pad_packed_sequence(key, batch_first=True)
         value, _ = pad_packed_sequence(value, batch_first=True)
 
-        embedded_key = self.key_linear(
-            key.view(key.shape[0] * key.shape[1], self.query_size)
-        ).view(key.shape[0], key.shape[1], self.query_size)
-
-        embedded_query = self.query_linear(
-            query.view(query.shape[0] * query.shape[1], self.query_size)
-        ).view(query.shape[0], query.shape[1], self.query_size)
+        embedded_key = self.key_linear(key)
+        embedded_query = self.query_linear(query)
 
         x = F.tanh(embedded_key.unsqueeze(1) + embedded_query.unsqueeze(2))
         attn_scores = self.v_linear(x.view(-1, self.query_size)).view(*x.shape[:3])
@@ -381,13 +371,30 @@ class SeqToSeq(nn.Module):
         self.decoder_embedding = decoder_embedding
         self.head = head
 
-    def forward(self, x, target):
-        x = self.encoder_embedding(x)
-        _, encoder_hidden = encoder(x)
+    def forward(self, x: PackedSequence, target: PackedSequence, max_len=150):
+        _, encoder_hidden = self.forward_encoder(x)
 
+        if len(target.batch_sizes) > 1:
+            return self.forward_decoder(target, encoder_hidden)
+
+        decoder_outputs = torch.zeros((target.batch_sizes, max_len), device=DEVICE)
+        for timestep in range(max_len):
+            target = self.forward_decoder(target, encoder_hidden)
+            target, lengths = pad_packed_sequence(target, batch_first=True)
+            target = torch.argmax(target, dim=2)
+            decoder_outputs[:, timestep] = target  # in place operation
+            target = pack_padded_sequence(
+                target, lengths, batch_first=True, enforce_sorted=False
+            )
+
+        return decoder_outputs
+
+    def forward_encoder(self, x: PackedSequence):
+        return self.encoder(self.encoder_embedding(x))
+
+    def forward_decoder(self, target: PackedSequence, encoder_hidden: PackedSequence):
         target = self.decoder_embedding(target)
-        decoder_output, _ = decoder(target, encoder_hidden)
-
+        decoder_output, _ = self.decoder(target, encoder_hidden)
         return self.head(decoder_output)
 
 
@@ -489,7 +496,7 @@ def summarise_tokens(tokens: list[list[int]]) -> tuple[int, int, float]:
 def indexes_from_text(
     lang: Lang, text: str, sos_token: bool = False, eos_token: bool = False
 ):
-    indexes = [lang.word2index[word] for word in text.split(" ")]
+    indexes = [lang.get_index(word) for word in text.split(" ")]
     if sos_token:
         indexes.insert(0, SOS_TOKEN)
     if eos_token:
@@ -579,7 +586,7 @@ def read_ingredients_recepies(data_dir_path: str):
             for ingredients, recepie in read_ingredient_recipe(file):
                 ingredients_per_recepie.append(normalise_string(ingredients))
                 recepies.append(normalise_string(recepie))
-        if i >= 5:
+        if i >= 10:
             break
         i += 1
     return ingredients_per_recepie, recepies
@@ -661,13 +668,7 @@ learning_rate = 0.001
 optimiser = optim.Adam(seq_to_seq.parameters(), lr=learning_rate)
 criterion = SequenceNLLLoss()
 
-# train(
-#     dataloader,
-#     seq_to_seq,
-#     optimiser,
-#     criterion,
-#     writer,
-# )
+train(dataloader, seq_to_seq, optimiser, criterion, writer, epochs=3)
 
 test_text = "10 oz chopped broccoli, 2 tbsp butter, 2 tbsp flour, 1/2 tsp salt, 1/4 tsp black pepper, 1/4 tsp ground nutmeg, 1 cup milk, 1 1/2 cup shredded swiss cheese, 2 tsp lemon juice, 2 cup cooked cubed turkey, 4 oz mushrooms, 1/4 cup grated Parmesan cheese, 1 can refrigerated biscuits"
 input = pack_sequence(
@@ -681,10 +682,21 @@ input = pack_sequence(
 )
 
 
-def sequential_forward_pass(input: PackedSequence, model):
-    input = pad_packed_sequence(input, batch_first=True)
-    for timestep in input.shape[1]:
-        print(input[:, timestep, :])
+def sequential_forward_pass(input: PackedSequence, model: nn.Module):
+    # input, lengths = pad_packed_sequence(input, batch_first=True)
+    # print(input)
+    # print(input.shape)
+    target = pack_sequence(
+        torch.full((input.batch_sizes[0], 1), SOS_TOKEN, device=DEVICE)
+    )
+    print(model.forward(input, target))
+    print(target.batch_sizes)
+    # for timestep in range(input.batch_sizes[0]):
+    #     target, lens = pad_packed_sequence(model(input, target), batch_first=True)
+
+    #     print(target.shape)
+    #     target, _ = torch.max(target, dim=2)
+    #     print(target.shape)
 
 
 sequential_forward_pass(input, seq_to_seq)
