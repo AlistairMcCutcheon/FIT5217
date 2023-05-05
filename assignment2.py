@@ -277,35 +277,17 @@ class PointerGen(nn.Module):
         )
 
 
-import random
-
-
 class SequenceNLLLoss(nn.Module):
     def forward(self, input: PackedSequence, target: PackedSequence) -> Any:
         input_seq_unpacked, input_seq_lengths = pad_packed_sequence(
             input, batch_first=True
         )
         target_seq_unpacked, _ = pad_packed_sequence(target, batch_first=True)
-        # print(target_seq_unpacked)
-        # print(target_seq_unpacked.shape)
-        # print(torch.max(input_seq_unpacked))
-        # print(torch.min(input_seq_unpacked))
-
-        # print(input_seq_unpacked.shape)
-        # print(torch.argmax(input_seq_unpacked, dim=2))
-        # print()
-        # print(torch.argmax(input_seq_unpacked, dim=2)[:, :-1])
-        # print(target_seq_unpacked[:, 1:])
         loss = 0
         for sequence, target_sequence, input_seq_length in zip(
             input_seq_unpacked, target_seq_unpacked, input_seq_lengths
         ):
-            if random.random() < 0.0001:
-                print(torch.argmax(sequence[: input_seq_length - 1], dim=1))
-                print(target_sequence[1:input_seq_length])
-                print()
             loss += (
-                # target output is offset
                 F.nll_loss(
                     sequence[: input_seq_length - 1],
                     target_sequence[1:input_seq_length],
@@ -407,7 +389,7 @@ class SeqToSeq(nn.Module):
         return self.decoder(self.decoder_embedding(x), hidden)
 
     def forward_decoder_sequential(self, x, hidden):
-        outputs = torch.zeros((x.batch_sizes, self.max_len), device=DEVICE)
+        outputs = torch.zeros((x.batch_sizes[0], self.max_len), device=DEVICE)
         for timestep in range(self.max_len):
             decoder_output, hidden = self.forward_decoder_parallel(x, hidden)
             x = self.head(decoder_output)
@@ -458,7 +440,7 @@ class SeqToSeqWithAttention(nn.Module):
         return self.decoder(self.decoder_embedding(x), hidden, encoder_outputs)
 
     def forward_decoder_sequential(self, x, hidden, encoder_outputs):
-        outputs = torch.zeros((x.batch_sizes, self.max_len), device=DEVICE)
+        outputs = torch.zeros((x.batch_sizes[0], self.max_len), device=DEVICE)
         for timestep in range(self.max_len):
             attn_out, decoder_outputs, _, hidden = self.forward_decoder_parallel(
                 x, hidden, encoder_outputs
@@ -489,28 +471,63 @@ class GetToThePoint(nn.Module):
         self.decoder_embedding = decoder_embedding
         self.head = head
         self.pointer_gen = pointer_gen
+        self.max_len = 150
 
     def forward(self, x, target):
-        embedded = self.encoder_embedding(x)
-        encoder_outputs, encoder_hidden = encoder(embedded)
+        encoder_outputs, encoder_hidden = self.forward_encoder(x)
 
-        target = self.decoder_embedding(target)
-        attn_out, decoder_output, attn_dist = decoder(
-            target, encoder_hidden, encoder_outputs
-        )
-        features = concat_packed_sequences(attn_out, decoder_output)
-        vocab_dist = self.head(features)
-        final_dist = self.pointer_gen(
-            input_tokens=x,
-            context=attn_out,
-            decoder_input=target,
-            decoder_output=decoder_output,
-            vocab_dist=vocab_dist,
-            attn_dist=attn_dist,
-            encoder_outputs=encoder_outputs,
+        if len(target.batch_sizes) > 1:
+            target = self.decoder_embedding(target)
+            attn_out, decoder_output, attn_dist, _ = self.decoder(
+                target, encoder_hidden, encoder_outputs
+            )
+            features = concat_packed_sequences(attn_out, decoder_output)
+            vocab_dist = self.head(features)
+            final_dist = self.pointer_gen(
+                input_tokens=x,
+                context=attn_out,
+                decoder_input=target,
+                decoder_output=decoder_output,
+                vocab_dist=vocab_dist,
+                attn_dist=attn_dist,
+                encoder_outputs=encoder_outputs,
+            )
+            return final_dist
+
+        return self.forward_decoder_sequential(
+            x, target, encoder_hidden, encoder_outputs
         )
 
-        return final_dist
+    def forward_decoder_sequential(self, x, target, hidden, encoder_outputs):
+        outputs = torch.zeros((target.batch_sizes[0], self.max_len), device=DEVICE)
+        for timestep in range(self.max_len):
+            target = self.decoder_embedding(target)
+            (
+                attn_out,
+                decoder_outputs,
+                attn_dist,
+                hidden,
+            ) = self.decoder(target, hidden, encoder_outputs)
+            features = concat_packed_sequences(attn_out, decoder_outputs)
+            vocab_dist = self.head(features)
+            final_dist = self.pointer_gen(
+                input_tokens=x,
+                context=attn_out,
+                decoder_input=target,
+                decoder_output=decoder_outputs,
+                vocab_dist=vocab_dist,
+                attn_dist=attn_dist,
+                encoder_outputs=encoder_outputs,
+            )
+
+            final_dist, lengths = pad_packed_sequence(final_dist, batch_first=True)
+            x = torch.argmax(final_dist, dim=2)
+            outputs[:, timestep] = x
+            x = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+        return outputs
+
+    def forward_encoder(self, x: PackedSequence):
+        return self.encoder(self.encoder_embedding(x))
 
 
 def concat_packed_sequences(seq1: PackedSequence, seq2: PackedSequence):
@@ -633,9 +650,9 @@ def read_ingredients_recepies(data_dir_path: str):
             for ingredients, recepie in read_ingredient_recipe(file):
                 ingredients_per_recepie.append(normalise_string(ingredients))
                 recepies.append(normalise_string(recepie))
-        # if i >= 10:
-        #     break
-        # i += 1
+        if i >= 10:
+            break
+        i += 1
     return ingredients_per_recepie, recepies
 
 
@@ -660,7 +677,6 @@ def train(
             seq_to_seq.zero_grad()
 
             output = seq_to_seq.forward(input_tensor, target_tensor)
-            # print(output)
             loss = criterion(output, target_tensor)
             loss.backward()
 
@@ -680,28 +696,15 @@ def train(
                 ]
             )
             inference(input, seq_to_seq, lang)
-        # print(output, target_tensor)
 
 
 def inference(input: PackedSequence, model: nn.Module, lang: Lang):
-    # input, lengths = pad_packed_sequence(input, batch_first=True)
-    # print(input)
-    # print(input.shape)
     target = pack_sequence(
         torch.full((input.batch_sizes[0], 1), SOS_TOKEN, device=DEVICE)
     )
     batch_tokens = model.forward(input, target)
     for tokens in batch_tokens:
-        print(tokens)
         print([lang.index2word[token.item()] for token in tokens])
-
-    # print(target.batch_sizes)
-    # for timestep in range(input.batch_sizes[0]):
-    #     target, lens = pad_packed_sequence(model(input, target), batch_first=True)
-
-    #     print(target.shape)
-    #     target, _ = torch.max(target, dim=2)
-    #     print(target.shape)
 
 
 def collate_fn(input_batch):
