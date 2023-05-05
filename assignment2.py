@@ -50,7 +50,7 @@ class CookingDataset(Dataset):
         indexes = {
             i
             for i, (x, y) in enumerate(zip(tokenised_ingredients, tokenised_recipes))
-            if len(x) <= 150 and len(y) <= max_len
+            if len(x) <= max_len and len(y) <= max_len
         }
 
         self.ingredients = [self.ingredients[x] for x in indexes]
@@ -228,12 +228,12 @@ class AttnDecoderRNN(nn.Module):
         self.attn = attn
 
     def forward(self, x: PackedSequence, hidden, encoder_outputs: PackedSequence):
-        decoder_output, _ = self.gru(x, hidden)
+        decoder_output, hidden = self.gru(x, hidden)
 
         attn_out, attn_dist = self.attn(
             key=encoder_outputs, value=encoder_outputs, query=decoder_output
         )
-        return attn_out, decoder_output, attn_dist
+        return attn_out, decoder_output, attn_dist, hidden
 
 
 class PointerGen(nn.Module):
@@ -277,21 +277,38 @@ class PointerGen(nn.Module):
         )
 
 
+import random
+
+
 class SequenceNLLLoss(nn.Module):
     def forward(self, input: PackedSequence, target: PackedSequence) -> Any:
         input_seq_unpacked, input_seq_lengths = pad_packed_sequence(
             input, batch_first=True
         )
         target_seq_unpacked, _ = pad_packed_sequence(target, batch_first=True)
+        # print(target_seq_unpacked)
+        # print(target_seq_unpacked.shape)
+        # print(torch.max(input_seq_unpacked))
+        # print(torch.min(input_seq_unpacked))
 
+        # print(input_seq_unpacked.shape)
+        # print(torch.argmax(input_seq_unpacked, dim=2))
+        # print()
+        # print(torch.argmax(input_seq_unpacked, dim=2)[:, :-1])
+        # print(target_seq_unpacked[:, 1:])
         loss = 0
         for sequence, target_sequence, input_seq_length in zip(
             input_seq_unpacked, target_seq_unpacked, input_seq_lengths
         ):
+            if random.random() < 0.0001:
+                print(torch.argmax(sequence[: input_seq_length - 1], dim=1))
+                print(target_sequence[1:input_seq_length])
+                print()
             loss += (
+                # target output is offset
                 F.nll_loss(
-                    sequence[:input_seq_length],
-                    target_sequence[:input_seq_length],
+                    sequence[: input_seq_length - 1],
+                    target_sequence[1:input_seq_length],
                     reduction="sum",
                 )
                 / input_seq_length
@@ -363,6 +380,7 @@ class SeqToSeq(nn.Module):
         encoder_embedding: Embedding,
         decoder_embedding,
         head: Head,
+        max_len=150,
     ) -> None:
         super().__init__()
         self.encoder = encoder
@@ -370,32 +388,34 @@ class SeqToSeq(nn.Module):
         self.encoder_embedding = encoder_embedding
         self.decoder_embedding = decoder_embedding
         self.head = head
+        self.max_len = max_len
 
-    def forward(self, x: PackedSequence, target: PackedSequence, max_len=150):
-        _, encoder_hidden = self.forward_encoder(x)
+    def forward(self, x: PackedSequence, target: PackedSequence):
+        _, hidden = self.forward_encoder(x)
 
         if len(target.batch_sizes) > 1:
-            return self.forward_decoder(target, encoder_hidden)
+            decoder_output, _ = self.forward_decoder_parallel(target, hidden)
+            return self.head(decoder_output)
 
-        decoder_outputs = torch.zeros((target.batch_sizes, max_len), device=DEVICE)
-        for timestep in range(max_len):
-            target = self.forward_decoder(target, encoder_hidden)
-            target, lengths = pad_packed_sequence(target, batch_first=True)
-            target = torch.argmax(target, dim=2)
-            decoder_outputs[:, timestep] = target  # in place operation
-            target = pack_padded_sequence(
-                target, lengths, batch_first=True, enforce_sorted=False
-            )
-
-        return decoder_outputs
+        return self.forward_decoder_sequential(target, hidden)
 
     def forward_encoder(self, x: PackedSequence):
         return self.encoder(self.encoder_embedding(x))
 
-    def forward_decoder(self, target: PackedSequence, encoder_hidden: PackedSequence):
-        target = self.decoder_embedding(target)
-        decoder_output, _ = self.decoder(target, encoder_hidden)
-        return self.head(decoder_output)
+    def forward_decoder_parallel(self, x: PackedSequence, hidden: PackedSequence):
+        print(hidden)
+        return self.decoder(self.decoder_embedding(x), hidden)
+
+    def forward_decoder_sequential(self, x, hidden):
+        outputs = torch.zeros((x.batch_sizes, self.max_len), device=DEVICE)
+        for timestep in range(self.max_len):
+            decoder_output, hidden = self.forward_decoder_parallel(x, hidden)
+            x = self.head(decoder_output)
+            x, lengths = pad_packed_sequence(x, batch_first=True)
+            x = torch.argmax(x, dim=2)
+            outputs[:, timestep] = x  # in place operation
+            x = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+        return outputs
 
 
 class SeqToSeqWithAttention(nn.Module):
@@ -406,6 +426,7 @@ class SeqToSeqWithAttention(nn.Module):
         encoder_embedding: Embedding,
         decoder_embedding: Embedding,
         head: Head,
+        max_len=150,
     ) -> None:
         super().__init__()
         self.encoder = encoder
@@ -413,16 +434,42 @@ class SeqToSeqWithAttention(nn.Module):
         self.encoder_embedding = encoder_embedding
         self.decoder_embedding = decoder_embedding
         self.head = head
+        self.max_len = max_len
 
     def forward(self, x, target):
-        x = self.encoder_embedding(x)
-        encoder_outputs, encoder_hidden = encoder(x)
+        encoder_outputs, hidden = self.forward_encoder(x)
 
-        target = self.decoder_embedding(target)
-        attn_out, decoder_output, _ = decoder(target, encoder_hidden, encoder_outputs)
-        features = concat_packed_sequences(attn_out, decoder_output)
+        if len(target.batch_sizes) > 1:
+            attn_out, decoder_outputs, _, _ = self.forward_decoder_parallel(
+                target, hidden, encoder_outputs
+            )
+            features = concat_packed_sequences(attn_out, decoder_outputs)
 
-        return self.head(features)
+            return self.head(features)
+
+        return self.forward_decoder_sequential(target, hidden, encoder_outputs)
+
+    def forward_encoder(self, x: PackedSequence):
+        return self.encoder(self.encoder_embedding(x))
+
+    def forward_decoder_parallel(
+        self, x: PackedSequence, hidden: PackedSequence, encoder_outputs: PackedSequence
+    ):
+        return self.decoder(self.decoder_embedding(x), hidden, encoder_outputs)
+
+    def forward_decoder_sequential(self, x, hidden, encoder_outputs):
+        outputs = torch.zeros((x.batch_sizes, self.max_len), device=DEVICE)
+        for timestep in range(self.max_len):
+            attn_out, decoder_outputs, _, hidden = self.forward_decoder_parallel(
+                x, hidden, encoder_outputs
+            )
+            features = concat_packed_sequences(attn_out, decoder_outputs)
+            x = self.head(features)
+            x, lengths = pad_packed_sequence(x, batch_first=True)
+            x = torch.argmax(x, dim=2)
+            outputs[:, timestep] = x  # in place operation
+            x = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+        return outputs
 
 
 class GetToThePoint(nn.Module):
@@ -586,9 +633,9 @@ def read_ingredients_recepies(data_dir_path: str):
             for ingredients, recepie in read_ingredient_recipe(file):
                 ingredients_per_recepie.append(normalise_string(ingredients))
                 recepies.append(normalise_string(recepie))
-        if i >= 10:
-            break
-        i += 1
+        # if i >= 10:
+        #     break
+        # i += 1
     return ingredients_per_recepie, recepies
 
 
@@ -605,6 +652,7 @@ def train(
     optimiser: Optimizer,
     criterion,
     writer: SummaryWriter,
+    lang: Lang,
     epochs: int = 10,
 ):
     for epoch in range(epochs):
@@ -612,11 +660,48 @@ def train(
             seq_to_seq.zero_grad()
 
             output = seq_to_seq.forward(input_tensor, target_tensor)
+            # print(output)
             loss = criterion(output, target_tensor)
             loss.backward()
 
             optimiser.step()
             writer.add_scalar("Loss", loss.item(), epoch * len(dataloader) + i)
+
+            test_text = "10 oz chopped broccoli, 2 tbsp butter, 2 tbsp flour, 1/2 tsp salt, 1/4 tsp black pepper, 1/4 tsp ground nutmeg, 1 cup milk, 1 1/2 cup shredded swiss cheese, 2 tsp lemon juice, 2 cup cooked cubed turkey, 4 oz mushrooms, 1/4 cup grated Parmesan cheese, 1 can refrigerated biscuits"
+            input = pack_sequence(
+                [
+                    torch.tensor(
+                        indexes_from_text(
+                            dataset.lang, test_text, sos_token=False, eos_token=True
+                        ),
+                        dtype=torch.long,
+                        device=DEVICE,
+                    )
+                ]
+            )
+            inference(input, seq_to_seq, lang)
+        # print(output, target_tensor)
+
+
+def inference(input: PackedSequence, model: nn.Module, lang: Lang):
+    # input, lengths = pad_packed_sequence(input, batch_first=True)
+    # print(input)
+    # print(input.shape)
+    target = pack_sequence(
+        torch.full((input.batch_sizes[0], 1), SOS_TOKEN, device=DEVICE)
+    )
+    batch_tokens = model.forward(input, target)
+    for tokens in batch_tokens:
+        print(tokens)
+        print([lang.index2word[token.item()] for token in tokens])
+
+    # print(target.batch_sizes)
+    # for timestep in range(input.batch_sizes[0]):
+    #     target, lens = pad_packed_sequence(model(input, target), batch_first=True)
+
+    #     print(target.shape)
+    #     target, _ = torch.max(target, dim=2)
+    #     print(target.shape)
 
 
 def collate_fn(input_batch):
@@ -630,7 +715,7 @@ def collate_fn(input_batch):
     return ingredients_batch, recipies_batch
 
 
-dataset = CookingDataset("data/train")
+dataset = CookingDataset("data/train", max_len=150)
 dataset.summarise()
 dataloader = DataLoader(dataset, 32, shuffle=True, collate_fn=collate_fn)
 
@@ -640,22 +725,22 @@ encoder_embedding = Embedding(dataset.lang.n_words, hidden_size).to(DEVICE)
 decoder_embedding = Embedding(dataset.lang.n_words, hidden_size).to(DEVICE)
 encoder = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
 
-decoder = DecoderRNN(hidden_size).to(DEVICE)
-head = Head(hidden_size, dataset.lang.n_words)
-seq_to_seq = SeqToSeq(encoder, decoder, encoder_embedding, decoder_embedding, head).to(
-    DEVICE
-)
+# decoder = DecoderRNN(hidden_size).to(DEVICE)
+# head = Head(hidden_size, dataset.lang.n_words)
+# seq_to_seq = SeqToSeq(encoder, decoder, encoder_embedding, decoder_embedding, head).to(
+#     DEVICE
+# )
 
 # decoder = AttnDecoderRNN(hidden_size, BahdanauAttention(256)).to(
 #     DEVICE
 # )
 # decoder = AttnDecoderRNN(hidden_size, DotProductAttention()).to(DEVICE)
 
-# decoder = AttnDecoderRNN(hidden_size, BahdanauAttention(256)).to(DEVICE)
-# head = Head(2 * hidden_size, dataset.lang.n_words)
-# seq_to_seq = SeqToSeqWithAttention(
-#     encoder, decoder, encoder_embedding, decoder_embedding, head
-# ).to(DEVICE)
+decoder = AttnDecoderRNN(hidden_size, BahdanauAttention(256)).to(DEVICE)
+head = Head(2 * hidden_size, dataset.lang.n_words)
+seq_to_seq = SeqToSeqWithAttention(
+    encoder, decoder, encoder_embedding, decoder_embedding, head
+).to(DEVICE)
 
 # pointer_gen = PointerGen(hidden_size).to(DEVICE)
 # seq_to_seq = GetToThePoint(
@@ -668,35 +753,4 @@ learning_rate = 0.001
 optimiser = optim.Adam(seq_to_seq.parameters(), lr=learning_rate)
 criterion = SequenceNLLLoss()
 
-train(dataloader, seq_to_seq, optimiser, criterion, writer, epochs=3)
-
-test_text = "10 oz chopped broccoli, 2 tbsp butter, 2 tbsp flour, 1/2 tsp salt, 1/4 tsp black pepper, 1/4 tsp ground nutmeg, 1 cup milk, 1 1/2 cup shredded swiss cheese, 2 tsp lemon juice, 2 cup cooked cubed turkey, 4 oz mushrooms, 1/4 cup grated Parmesan cheese, 1 can refrigerated biscuits"
-input = pack_sequence(
-    [
-        torch.tensor(
-            indexes_from_text(dataset.lang, test_text, sos_token=False, eos_token=True),
-            dtype=torch.long,
-            device=DEVICE,
-        )
-    ]
-)
-
-
-def sequential_forward_pass(input: PackedSequence, model: nn.Module):
-    # input, lengths = pad_packed_sequence(input, batch_first=True)
-    # print(input)
-    # print(input.shape)
-    target = pack_sequence(
-        torch.full((input.batch_sizes[0], 1), SOS_TOKEN, device=DEVICE)
-    )
-    print(model.forward(input, target))
-    print(target.batch_sizes)
-    # for timestep in range(input.batch_sizes[0]):
-    #     target, lens = pad_packed_sequence(model(input, target), batch_first=True)
-
-    #     print(target.shape)
-    #     target, _ = torch.max(target, dim=2)
-    #     print(target.shape)
-
-
-sequential_forward_pass(input, seq_to_seq)
+train(dataloader, seq_to_seq, optimiser, criterion, writer, dataset.lang, epochs=500)
