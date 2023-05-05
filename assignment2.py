@@ -262,18 +262,21 @@ class PointerGen(nn.Module):
         vocab_dist, lengths = pad_packed_sequence(vocab_dist, batch_first=True)
         attn_dist, _ = pad_packed_sequence(attn_dist, batch_first=True)
         encoder_outputs, _ = pad_packed_sequence(encoder_outputs, batch_first=True)
+
         p_gen = F.sigmoid(
             self.context_linear(context)
             + self.decoder_out_linear(decoder_output)
             + self.decoder_input_linear(decoder_input)
         )
+        # print(p_gen.shape)
         copy_dist = torch.scatter_add(
             input=torch.zeros_like(vocab_dist),
             dim=2,
             index=input_tokens.unsqueeze(1).expand(attn_dist.shape),
             src=attn_dist,
         )
-        final_dist = vocab_dist * p_gen + (1 - p_gen) * F.log_softmax(copy_dist)
+        # print(copy_dist.shape)
+        final_dist = vocab_dist * p_gen + (1 - p_gen) * F.log_softmax(copy_dist, dim=2)
         return pack_padded_sequence(
             final_dist, lengths, batch_first=True, enforce_sorted=False
         )
@@ -387,7 +390,6 @@ class SeqToSeq(nn.Module):
         return self.encoder(self.encoder_embedding(x))
 
     def forward_decoder_parallel(self, x: PackedSequence, hidden: PackedSequence):
-        print(hidden)
         return self.decoder(self.decoder_embedding(x), hidden)
 
     def forward_decoder_sequential(self, x, hidden):
@@ -399,7 +401,6 @@ class SeqToSeq(nn.Module):
             x = torch.argmax(x, dim=2)
             outputs[:, timestep] = x  # in place operation
             x = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
-        print(outputs.shape)
         return outputs
 
 
@@ -480,6 +481,8 @@ class GetToThePoint(nn.Module):
         encoder_outputs, encoder_hidden = self.forward_encoder(x)
 
         if len(target.batch_sizes) > 1:
+            # print(pad_packed_sequence(x, batch_first=True)[0])
+            # print(pad_packed_sequence(target, batch_first=True)[0])
             target = self.decoder_embedding(target)
             attn_out, decoder_output, attn_dist, _ = self.decoder(
                 target, encoder_hidden, encoder_outputs
@@ -497,8 +500,10 @@ class GetToThePoint(nn.Module):
                 attn_dist=attn_dist,
                 encoder_outputs=encoder_outputs,
             )
+            final_dist = vocab_dist
             # print(pad_packed_sequence(final_dist, batch_first=True)[0].shape)
-
+            # print()
+            # print(final_dist)
             return final_dist
         # print(target)
         return self.forward_decoder_sequential(
@@ -507,9 +512,10 @@ class GetToThePoint(nn.Module):
 
     def forward_decoder_sequential(self, x, target, hidden, encoder_outputs):
         outputs = torch.zeros((target.batch_sizes[0], self.max_len), device=DEVICE)
+
         for timestep in range(self.max_len):
             # print(target)
-            print(target)
+            # print(target)
             target = self.decoder_embedding(target)
             (
                 attn_out,
