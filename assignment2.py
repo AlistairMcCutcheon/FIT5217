@@ -95,7 +95,7 @@ class CookingDataset(Dataset):
         print(len(self))
         print()
 
-        print("Vocabulary Size, including SOS_TOKEN and EOS_TOKEN:")
+        print("Vocabulary Size, including SOS_TOKEN, EOS_TOKEN, and UNK_TOKEN:")
         print(self.lang.n_words)
         print()
 
@@ -650,9 +650,9 @@ def read_ingredients_recepies(data_dir_path: str):
             for ingredients, recepie in read_ingredient_recipe(file):
                 ingredients_per_recepie.append(normalise_string(ingredients))
                 recepies.append(normalise_string(recepie))
-        if i >= 10:
-            break
-        i += 1
+        # if i >= 5:
+        #     break
+        # i += 1
     return ingredients_per_recepie, recepies
 
 
@@ -664,16 +664,17 @@ def get_alphabet(text_lines: Iterable[str]) -> set[str]:
 
 
 def train(
-    dataloader: DataLoader,
+    train_dataloader: DataLoader,
     seq_to_seq,
     optimiser: Optimizer,
     criterion,
     writer: SummaryWriter,
     lang: Lang,
     epochs: int = 10,
+    test_dataloader: DataLoader = None,
 ):
     for epoch in range(epochs):
-        for i, (input_tensor, target_tensor) in enumerate(dataloader):
+        for i, (input_tensor, target_tensor) in enumerate(train_dataloader):
             seq_to_seq.zero_grad()
 
             output = seq_to_seq.forward(input_tensor, target_tensor)
@@ -681,21 +682,20 @@ def train(
             loss.backward()
 
             optimiser.step()
-            writer.add_scalar("Loss", loss.item(), epoch * len(dataloader) + i)
-
-            test_text = "10 oz chopped broccoli, 2 tbsp butter, 2 tbsp flour, 1/2 tsp salt, 1/4 tsp black pepper, 1/4 tsp ground nutmeg, 1 cup milk, 1 1/2 cup shredded swiss cheese, 2 tsp lemon juice, 2 cup cooked cubed turkey, 4 oz mushrooms, 1/4 cup grated Parmesan cheese, 1 can refrigerated biscuits"
-            input = pack_sequence(
-                [
-                    torch.tensor(
-                        indexes_from_text(
-                            dataset.lang, test_text, sos_token=False, eos_token=True
-                        ),
-                        dtype=torch.long,
-                        device=DEVICE,
-                    )
-                ]
+            writer.add_scalar(
+                "Train Loss", loss.item(), epoch * len(train_dataloader) + i
             )
-            inference(input, seq_to_seq, lang)
+
+        if test_dataloader is None:
+            continue
+
+        with torch.no_grad():
+            for i, (input_tensor, target_tensor) in enumerate(test_dataloader):
+                output = seq_to_seq.forward(input_tensor, target_tensor)
+                loss = criterion(output, target_tensor)
+                writer.add_scalar(
+                    "Dev Loss", loss.item(), epoch * len(test_dataloader) + i
+                )
 
 
 def inference(input: PackedSequence, model: nn.Module, lang: Lang):
@@ -718,15 +718,32 @@ def collate_fn(input_batch):
     return ingredients_batch, recipies_batch
 
 
-dataset = CookingDataset("data/train", max_len=150)
-dataset.summarise()
-dataloader = DataLoader(dataset, 32, shuffle=True, collate_fn=collate_fn)
+train_dataset = CookingDataset("data/train", max_len=150)
+
+dev_dataset = CookingDataset("data/dev", max_len=150)
+
+print("")
+print("")
+print("TRAINING SET")
+print("")
+print("")
+train_dataset.summarise()
+print("")
+print("")
+print("DEV SET")
+print("")
+print("")
+dev_dataset.summarise()
+train_dataloader = DataLoader(train_dataset, 32, shuffle=True, collate_fn=collate_fn)
+print(f"Length of train dataloader: {len(train_dataloader)}")
+dev_dataloader = DataLoader(dev_dataset, 32, shuffle=True, collate_fn=collate_fn)
+print(f"Length of dev dataloader: {len(dev_dataloader)}")
 
 hidden_size = 256
 
-encoder_embedding = Embedding(dataset.lang.n_words, hidden_size).to(DEVICE)
-decoder_embedding = Embedding(dataset.lang.n_words, hidden_size).to(DEVICE)
-encoder = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
+encoder_embedding = Embedding(train_dataset.lang.n_words, hidden_size).to(DEVICE)
+decoder_embedding = Embedding(train_dataset.lang.n_words, hidden_size).to(DEVICE)
+encoder = EncoderRNN(train_dataset.lang.n_words, hidden_size).to(DEVICE)
 
 # decoder = DecoderRNN(hidden_size).to(DEVICE)
 # head = Head(hidden_size, dataset.lang.n_words)
@@ -740,7 +757,7 @@ encoder = EncoderRNN(dataset.lang.n_words, hidden_size).to(DEVICE)
 # decoder = AttnDecoderRNN(hidden_size, DotProductAttention()).to(DEVICE)
 
 decoder = AttnDecoderRNN(hidden_size, BahdanauAttention(256)).to(DEVICE)
-head = Head(2 * hidden_size, dataset.lang.n_words)
+head = Head(2 * hidden_size, train_dataset.lang.n_words)
 seq_to_seq = SeqToSeqWithAttention(
     encoder, decoder, encoder_embedding, decoder_embedding, head
 ).to(DEVICE)
@@ -756,4 +773,29 @@ learning_rate = 0.001
 optimiser = optim.Adam(seq_to_seq.parameters(), lr=learning_rate)
 criterion = SequenceNLLLoss()
 
-train(dataloader, seq_to_seq, optimiser, criterion, writer, dataset.lang, epochs=500)
+train(
+    train_dataloader,
+    seq_to_seq,
+    optimiser,
+    criterion,
+    writer,
+    train_dataset.lang,
+    epochs=500,
+    test_dataloader=dev_dataloader,
+)
+# test_text = "10 oz chopped broccoli, 2 tbsp butter, 2 tbsp flour, 1/2 tsp salt, 1/4 tsp black pepper, 1/4 tsp ground nutmeg, 1 cup milk, 1 1/2 cup shredded swiss cheese, 2 tsp lemon juice, 2 cup cooked cubed turkey, 4 oz mushrooms, 1/4 cup grated Parmesan cheese, 1 can refrigerated biscuits"
+# input = pack_sequence(
+#     [
+#         torch.tensor(
+#             indexes_from_text(
+#                 train_dataset.lang,
+#                 test_text,
+#                 sos_token=False,
+#                 eos_token=True,
+#             ),
+#             dtype=torch.long,
+#             device=DEVICE,
+#         )
+#     ]
+# )
+# inference(input, seq_to_seq, lang)
