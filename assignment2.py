@@ -31,12 +31,14 @@ UNK_TOKEN = 2
 
 
 class CookingDataset(Dataset):
-    def __init__(self, data_dir_path: str, max_len: int = 150) -> None:
+    def __init__(self, data_dir_path: str, lang=None, max_len: int = 150) -> None:
         super().__init__()
 
         self.ingredients, self.recipes = read_ingredients_recepies(data_dir_path)
 
-        self.lang = create_lang(self.ingredients, self.recipes)
+        self.lang = (
+            create_lang(self.ingredients, self.recipes) if lang is None else lang
+        )
 
         tokenised_ingredients = [
             indexes_from_text(self.lang, x, sos_token=False, eos_token=True)
@@ -397,6 +399,7 @@ class SeqToSeq(nn.Module):
             x = torch.argmax(x, dim=2)
             outputs[:, timestep] = x  # in place operation
             x = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+        print(outputs.shape)
         return outputs
 
 
@@ -481,8 +484,10 @@ class GetToThePoint(nn.Module):
             attn_out, decoder_output, attn_dist, _ = self.decoder(
                 target, encoder_hidden, encoder_outputs
             )
+
             features = concat_packed_sequences(attn_out, decoder_output)
             vocab_dist = self.head(features)
+            # print(pad_packed_sequence(vocab_dist, batch_first=True)[0].shape)
             final_dist = self.pointer_gen(
                 input_tokens=x,
                 context=attn_out,
@@ -492,8 +497,10 @@ class GetToThePoint(nn.Module):
                 attn_dist=attn_dist,
                 encoder_outputs=encoder_outputs,
             )
-            return final_dist
+            # print(pad_packed_sequence(final_dist, batch_first=True)[0].shape)
 
+            return final_dist
+        # print(target)
         return self.forward_decoder_sequential(
             x, target, encoder_hidden, encoder_outputs
         )
@@ -501,6 +508,8 @@ class GetToThePoint(nn.Module):
     def forward_decoder_sequential(self, x, target, hidden, encoder_outputs):
         outputs = torch.zeros((target.batch_sizes[0], self.max_len), device=DEVICE)
         for timestep in range(self.max_len):
+            # print(target)
+            print(target)
             target = self.decoder_embedding(target)
             (
                 attn_out,
@@ -521,9 +530,14 @@ class GetToThePoint(nn.Module):
             )
 
             final_dist, lengths = pad_packed_sequence(final_dist, batch_first=True)
-            x = torch.argmax(final_dist, dim=2)
-            outputs[:, timestep] = x
-            x = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+            target = torch.argmax(final_dist, dim=2)
+            outputs[:, timestep] = target
+
+            target = pack_padded_sequence(
+                target, lengths, batch_first=True, enforce_sorted=False
+            )
+        # print("22222222222222222")
+        # print(outputs.shape)
         return outputs
 
     def forward_encoder(self, x: PackedSequence):
@@ -682,29 +696,86 @@ def train(
             loss.backward()
 
             optimiser.step()
-            writer.add_scalar(
-                "Train Loss", loss.item(), epoch * len(train_dataloader) + i
+
+            writer.add_scalars(
+                "Loss", {"Train": loss.item()}, epoch * len(train_dataloader) + i
             )
 
-        if test_dataloader is None:
-            continue
+            test_text = "10 oz chopped broccoli, 2 tbsp butter, 2 tbsp flour, 1/2 tsp salt, 1/4 tsp black pepper, 1/4 tsp ground nutmeg, 1 cup milk, 1 1/2 cup shredded swiss cheese, 2 tsp lemon juice, 2 cup cooked cubed turkey, 4 oz mushrooms, 1/4 cup grated Parmesan cheese, 1 can refrigerated biscuits"
+            input = pack_sequence(
+                [
+                    torch.tensor(
+                        indexes_from_text(
+                            train_dataset.lang,
+                            test_text,
+                            sos_token=False,
+                            eos_token=True,
+                        ),
+                        dtype=torch.long,
+                        device=DEVICE,
+                    )
+                ]
+            )
+            print(inference(input, seq_to_seq, lang))
 
-        with torch.no_grad():
-            for i, (input_tensor, target_tensor) in enumerate(test_dataloader):
-                output = seq_to_seq.forward(input_tensor, target_tensor)
-                loss = criterion(output, target_tensor)
-                writer.add_scalar(
-                    "Dev Loss", loss.item(), epoch * len(test_dataloader) + i
+            if test_dataloader is None:
+                continue
+            if i % 100 == 0:
+                test_loss = 0
+                with torch.no_grad():
+                    for input_tensor, target_tensor in test_dataloader:
+                        output = seq_to_seq.forward(input_tensor, target_tensor)
+                        loss = criterion(output, target_tensor)
+                        test_loss += loss.item()
+                writer.add_scalars(
+                    "Loss",
+                    {"Dev": test_loss / len(test_dataloader)},
+                    epoch * len(train_dataloader) + i,
                 )
+
+
+from nltk.translate.bleu_score import sentence_bleu
+
+
+def eval(
+    dataloader: DataLoader,
+    seq_to_seq: nn.Module,
+    lang: Lang,
+    criterion: nn.Module,
+    iteration: int,
+):
+    total_loss = 0
+    for input_tensor, target_tensor in dataloader:
+        with torch.no_grad():
+            output = seq_to_seq.forward(input_tensor, target_tensor)
+            total_loss += criterion(output, target_tensor).item()
+        batch_words = batch_tokens_to_words(output)
+        for text in batch_words:
+            sentence_bleu(
+                [
+                    text,
+                ]
+            )
+    writer.add_scalars("Loss", {"Dev": total_loss}, iteration)
 
 
 def inference(input: PackedSequence, model: nn.Module, lang: Lang):
     target = pack_sequence(
         torch.full((input.batch_sizes[0], 1), SOS_TOKEN, device=DEVICE)
     )
-    batch_tokens = model.forward(input, target)
+    print("1")
+    with torch.no_grad():
+        print(target)
+        batch_tokens = model.forward(input, target)
+
+    return batch_tokens_to_words(batch_tokens, lang)
+
+
+def batch_tokens_to_words(batch_tokens: Tensor, lang: Lang):
+    batch_words = []
     for tokens in batch_tokens:
-        print([lang.index2word[token.item()] for token in tokens])
+        batch_words.append([lang.index2word[token.item()] for token in tokens])
+    return batch_words
 
 
 def collate_fn(input_batch):
@@ -720,7 +791,7 @@ def collate_fn(input_batch):
 
 train_dataset = CookingDataset("data/train", max_len=150)
 
-dev_dataset = CookingDataset("data/dev", max_len=150)
+dev_dataset = CookingDataset("data/dev", lang=train_dataset.lang, max_len=150)
 
 print("")
 print("")
@@ -734,7 +805,9 @@ print("DEV SET")
 print("")
 print("")
 dev_dataset.summarise()
-train_dataloader = DataLoader(train_dataset, 32, shuffle=True, collate_fn=collate_fn)
+train_dataloader = DataLoader(
+    train_dataset, 32, shuffle=True, collate_fn=collate_fn, drop_last=True
+)
 print(f"Length of train dataloader: {len(train_dataloader)}")
 dev_dataloader = DataLoader(dev_dataset, 32, shuffle=True, collate_fn=collate_fn)
 print(f"Length of dev dataloader: {len(dev_dataloader)}")
@@ -746,7 +819,7 @@ decoder_embedding = Embedding(train_dataset.lang.n_words, hidden_size).to(DEVICE
 encoder = EncoderRNN(train_dataset.lang.n_words, hidden_size).to(DEVICE)
 
 # decoder = DecoderRNN(hidden_size).to(DEVICE)
-# head = Head(hidden_size, dataset.lang.n_words)
+# head = Head(hidden_size, train_dataset.lang.n_words)
 # seq_to_seq = SeqToSeq(encoder, decoder, encoder_embedding, decoder_embedding, head).to(
 #     DEVICE
 # )
@@ -758,14 +831,14 @@ encoder = EncoderRNN(train_dataset.lang.n_words, hidden_size).to(DEVICE)
 
 decoder = AttnDecoderRNN(hidden_size, BahdanauAttention(256)).to(DEVICE)
 head = Head(2 * hidden_size, train_dataset.lang.n_words)
-seq_to_seq = SeqToSeqWithAttention(
-    encoder, decoder, encoder_embedding, decoder_embedding, head
-).to(DEVICE)
-
-# pointer_gen = PointerGen(hidden_size).to(DEVICE)
-# seq_to_seq = GetToThePoint(
-#     encoder, decoder, encoder_embedding, decoder_embedding, head, pointer_gen
+# seq_to_seq = SeqToSeqWithAttention(
+#     encoder, decoder, encoder_embedding, decoder_embedding, head
 # ).to(DEVICE)
+
+pointer_gen = PointerGen(hidden_size).to(DEVICE)
+seq_to_seq = GetToThePoint(
+    encoder, decoder, encoder_embedding, decoder_embedding, head, pointer_gen
+).to(DEVICE)
 
 writer = SummaryWriter()
 
