@@ -670,9 +670,9 @@ def read_ingredients_recepies(data_dir_path: str):
             for ingredients, recepie in read_ingredient_recipe(file):
                 ingredients_per_recepie.append(normalise_string(ingredients))
                 recepies.append(normalise_string(recepie))
-        # if i >= 5:
-        #     break
-        # i += 1
+        if i >= 5:
+            break
+        i += 1
     return ingredients_per_recepie, recepies
 
 
@@ -722,22 +722,28 @@ def train(
                     )
                 ]
             )
-            print(inference(input, seq_to_seq, lang))
+            # print(inference(input, seq_to_seq, lang))
 
             if test_dataloader is None:
                 continue
             if i % 100 == 0:
-                test_loss = 0
-                with torch.no_grad():
-                    for input_tensor, target_tensor in test_dataloader:
-                        output = seq_to_seq.forward(input_tensor, target_tensor)
-                        loss = criterion(output, target_tensor)
-                        test_loss += loss.item()
-                writer.add_scalars(
-                    "Loss",
-                    {"Dev": test_loss / len(test_dataloader)},
+                eval(
+                    dev_dataloader,
+                    seq_to_seq,
+                    criterion,
                     epoch * len(train_dataloader) + i,
                 )
+                # test_loss = 0
+                # with torch.no_grad():
+                #     for input_tensor, target_tensor in test_dataloader:
+                #         output = seq_to_seq.forward(input_tensor, target_tensor)
+                #         loss = criterion(output, target_tensor)
+                #         test_loss += loss.item()
+                # writer.add_scalars(
+                #     "Loss",
+                #     {"Dev": test_loss / len(test_dataloader)},
+                #     epoch * len(train_dataloader) + i,
+                # )
 
 
 from nltk.translate.bleu_score import sentence_bleu
@@ -746,7 +752,6 @@ from nltk.translate.bleu_score import sentence_bleu
 def eval(
     dataloader: DataLoader,
     seq_to_seq: nn.Module,
-    lang: Lang,
     criterion: nn.Module,
     iteration: int,
 ):
@@ -755,13 +760,21 @@ def eval(
         with torch.no_grad():
             output = seq_to_seq.forward(input_tensor, target_tensor)
             total_loss += criterion(output, target_tensor).item()
-        batch_words = batch_tokens_to_words(output)
-        for text in batch_words:
-            sentence_bleu(
-                [
-                    text,
-                ]
-            )
+        output, _ = pad_packed_sequence(output, batch_first=True)
+        output = torch.argmax(output, dim=2)
+        target_tensor, _ = pad_packed_sequence(target_tensor, batch_first=True)
+        # batch_words = batch_tokens_to_words(output)
+        # batch_target = batch_tokens_to_words(target_tensor)
+        for target_text, output_text in zip(target_tensor, output):
+            # print(target_text)
+            # print(output_text)
+            # print(target_text.tolist())
+            # print(output_text.tolist())
+            # print([target_text.tolist()])
+            print(target_text)
+            print(output_text)
+            print(sentence_bleu([target_text.tolist()], output_text.tolist()))
+            # print("Aaaaaaaaaaa")
     writer.add_scalars("Loss", {"Dev": total_loss}, iteration)
 
 
@@ -771,7 +784,7 @@ def inference(input: PackedSequence, model: nn.Module, lang: Lang):
     )
     print("1")
     with torch.no_grad():
-        print(target)
+        # print(target)
         batch_tokens = model.forward(input, target)
 
     return batch_tokens_to_words(batch_tokens, lang)
