@@ -34,10 +34,14 @@ UNK_TOKEN = 2
 
 
 class CookingDataset(Dataset):
-    def __init__(self, data_dir_path: str, lang=None, max_len: int = 150) -> None:
+    def __init__(
+        self, data_dir_path: str, lang=None, max_len: int = 150, preprocess_data=False
+    ) -> None:
         super().__init__()
 
-        self.ingredients, self.recipes = read_ingredients_recepies(data_dir_path)
+        self.ingredients, self.recipes = read_ingredients_recepies(
+            data_dir_path, preprocess_data=preprocess_data
+        )
 
         self.lang = (
             create_lang(self.ingredients, self.recipes) if lang is None else lang
@@ -271,14 +275,12 @@ class PointerGen(nn.Module):
             + self.decoder_out_linear(decoder_output)
             + self.decoder_input_linear(decoder_input)
         )
-        # print(p_gen.shape)
         copy_dist = torch.scatter_add(
             input=torch.zeros_like(vocab_dist),
             dim=2,
             index=input_tokens.unsqueeze(1).expand(attn_dist.shape),
             src=attn_dist,
         )
-        # print(copy_dist.shape)
         final_dist = vocab_dist * p_gen + (1 - p_gen) * F.log_softmax(copy_dist, dim=2)
         return pack_padded_sequence(
             final_dist, lengths, batch_first=True, enforce_sorted=False
@@ -503,11 +505,7 @@ class GetToThePoint(nn.Module):
                 encoder_outputs=encoder_outputs,
             )
             final_dist = vocab_dist
-            # print(pad_packed_sequence(final_dist, batch_first=True)[0].shape)
-            # print()
-            # print(final_dist)
             return final_dist
-        # print(target)
         return self.forward_decoder_sequential(
             x, target, encoder_hidden, encoder_outputs
         )
@@ -515,8 +513,6 @@ class GetToThePoint(nn.Module):
     def forward_decoder_sequential(self, x, target, hidden, encoder_outputs):
         outputs = torch.zeros((target.batch_sizes[0], self.max_len), device=DEVICE)
         for timestep in range(self.max_len):
-            # print(target)
-            # print(target)
             target = self.decoder_embedding(target)
             (
                 attn_out,
@@ -668,15 +664,19 @@ def read_next_recepie(text_lines: Iterable[str]) -> str:
     return "".join(recepie_lines)
 
 
-def read_ingredients_recepies(data_dir_path: str):
+def read_ingredients_recepies(data_dir_path: str, preprocess_data=False):
     ingredients_per_recepie = []
     recepies = []
     i = 0
     for recipes_file_path in Path(data_dir_path).glob("*"):
         with open(recipes_file_path, "r") as file:
             for ingredients, recepie in read_ingredient_recipe(file):
-                ingredients_per_recepie.append(normalise_string(ingredients))
-                recepies.append(normalise_string(recepie))
+                if preprocess_data:
+                    ingredients_per_recepie.append(normalise_string(ingredients))
+                    recepies.append(normalise_string(recepie))
+                    continue
+                ingredients_per_recepie.append(ingredients)
+                recepies.append(recepie)
         if i >= 5:
             break
         i += 1
