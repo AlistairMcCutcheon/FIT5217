@@ -479,7 +479,6 @@ class GetToThePoint(nn.Module):
 
     def forward(self, x, target):
         encoder_outputs, encoder_hidden = self.forward_encoder(x)
-
         if len(target.batch_sizes) > 1:
             # print(pad_packed_sequence(x, batch_first=True)[0])
             # print(pad_packed_sequence(target, batch_first=True)[0])
@@ -512,7 +511,6 @@ class GetToThePoint(nn.Module):
 
     def forward_decoder_sequential(self, x, target, hidden, encoder_outputs):
         outputs = torch.zeros((target.batch_sizes[0], self.max_len), device=DEVICE)
-
         for timestep in range(self.max_len):
             # print(target)
             # print(target)
@@ -537,14 +535,20 @@ class GetToThePoint(nn.Module):
 
             final_dist, lengths = pad_packed_sequence(final_dist, batch_first=True)
             target = torch.argmax(final_dist, dim=2)
-            outputs[:, timestep] = target
+
+            outputs[:, timestep] = target.squeeze(1)
 
             target = pack_padded_sequence(
                 target, lengths, batch_first=True, enforce_sorted=False
             )
-        # print("22222222222222222")
-        # print(outputs.shape)
-        return outputs
+        outputs = torch.cat(
+            (outputs, torch.full((outputs.shape[0], 1), EOS_TOKEN, device=DEVICE)),
+            dim=1,
+        )
+        lengths = torch.argmax(torch.eq(outputs, EOS_TOKEN).to(torch.uint8), dim=1) + 1
+        return pack_padded_sequence(
+            outputs, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
 
     def forward_encoder(self, x: PackedSequence):
         return self.encoder(self.encoder_embedding(x))
@@ -707,23 +711,6 @@ def train(
                 "Loss", {"Train": loss.item()}, epoch * len(train_dataloader) + i
             )
 
-            test_text = "10 oz chopped broccoli, 2 tbsp butter, 2 tbsp flour, 1/2 tsp salt, 1/4 tsp black pepper, 1/4 tsp ground nutmeg, 1 cup milk, 1 1/2 cup shredded swiss cheese, 2 tsp lemon juice, 2 cup cooked cubed turkey, 4 oz mushrooms, 1/4 cup grated Parmesan cheese, 1 can refrigerated biscuits"
-            input = pack_sequence(
-                [
-                    torch.tensor(
-                        indexes_from_text(
-                            train_dataset.lang,
-                            test_text,
-                            sos_token=False,
-                            eos_token=True,
-                        ),
-                        dtype=torch.long,
-                        device=DEVICE,
-                    )
-                ]
-            )
-            # print(inference(input, seq_to_seq, lang))
-
             if test_dataloader is None:
                 continue
             if i % 100 == 0:
@@ -732,18 +719,8 @@ def train(
                     seq_to_seq,
                     criterion,
                     epoch * len(train_dataloader) + i,
+                    lang,
                 )
-                # test_loss = 0
-                # with torch.no_grad():
-                #     for input_tensor, target_tensor in test_dataloader:
-                #         output = seq_to_seq.forward(input_tensor, target_tensor)
-                #         loss = criterion(output, target_tensor)
-                #         test_loss += loss.item()
-                # writer.add_scalars(
-                #     "Loss",
-                #     {"Dev": test_loss / len(test_dataloader)},
-                #     epoch * len(train_dataloader) + i,
-                # )
 
 
 from nltk.translate.bleu_score import sentence_bleu
@@ -754,35 +731,74 @@ def eval(
     seq_to_seq: nn.Module,
     criterion: nn.Module,
     iteration: int,
+    lang: Lang,
 ):
     total_loss = 0
+    total_bleu = 0
     for input_tensor, target_tensor in dataloader:
         with torch.no_grad():
-            output = seq_to_seq.forward(input_tensor, target_tensor)
-            total_loss += criterion(output, target_tensor).item()
-        output, _ = pad_packed_sequence(output, batch_first=True)
-        output = torch.argmax(output, dim=2)
-        target_tensor, _ = pad_packed_sequence(target_tensor, batch_first=True)
+            parallel_output = seq_to_seq.forward(input_tensor, target_tensor)
+            total_loss += criterion(parallel_output, target_tensor).item()
+            sequential_output = seq_to_seq.forward(
+                input_tensor,
+                pack_sequence(
+                    torch.full(
+                        (input_tensor.batch_sizes[0], 1), SOS_TOKEN, device=DEVICE
+                    )
+                ),
+            )
+        output, output_lengths = pad_packed_sequence(
+            sequential_output, batch_first=True
+        )
+        # print(output)
+        # print(output.shape)
+        # output = torch.argmax(output, dim=2)
+        target_tensor, target_lengths = pad_packed_sequence(
+            target_tensor, batch_first=True
+        )
         # batch_words = batch_tokens_to_words(output)
         # batch_target = batch_tokens_to_words(target_tensor)
-        for target_text, output_text in zip(target_tensor, output):
+        for target_text, target_length, output_text, output_length in zip(
+            target_tensor, target_lengths, output, output_lengths
+        ):
+            target_text = target_text[1:target_length]
+            output_text = output_text[:output_length]
             # print(target_text)
             # print(output_text)
             # print(target_text.tolist())
             # print(output_text.tolist())
             # print([target_text.tolist()])
-            print(target_text)
-            print(output_text)
-            print(sentence_bleu([target_text.tolist()], output_text.tolist()))
-            # print("Aaaaaaaaaaa")
-    writer.add_scalars("Loss", {"Dev": total_loss}, iteration)
+            # print("Target:")
+            # print(tokens_to_words(target_text, lang))
+            # print("Output:")
+            # print(tokens_to_words(output_text, lang))
+            # print("Bleu Score:")
+            total_bleu += sentence_bleu([target_text.tolist()], output_text.tolist())
+    writer.add_scalars("Loss", {"Dev": total_loss / len(dataloader)}, iteration)
+    writer.add_scalars("Bleu", {"Dev": total_bleu / len(dataloader)}, iteration)
+
+    test_text = "10 oz chopped broccoli, 2 tbsp butter, 2 tbsp flour, 1/2 tsp salt, 1/4 tsp black pepper, 1/4 tsp ground nutmeg, 1 cup milk, 1 1/2 cup shredded swiss cheese, 2 tsp lemon juice, 2 cup cooked cubed turkey, 4 oz mushrooms, 1/4 cup grated Parmesan cheese, 1 can refrigerated biscuits"
+    input = pack_sequence(
+        [
+            torch.tensor(
+                indexes_from_text(
+                    train_dataset.lang,
+                    test_text,
+                    sos_token=False,
+                    eos_token=True,
+                ),
+                dtype=torch.long,
+                device=DEVICE,
+            )
+        ]
+    )
+    # print(inference(input, seq_to_seq, lang))
 
 
 def inference(input: PackedSequence, model: nn.Module, lang: Lang):
     target = pack_sequence(
         torch.full((input.batch_sizes[0], 1), SOS_TOKEN, device=DEVICE)
     )
-    print("1")
     with torch.no_grad():
         # print(target)
         batch_tokens = model.forward(input, target)
@@ -793,8 +809,14 @@ def inference(input: PackedSequence, model: nn.Module, lang: Lang):
 def batch_tokens_to_words(batch_tokens: Tensor, lang: Lang):
     batch_words = []
     for tokens in batch_tokens:
-        batch_words.append([lang.index2word[token.item()] for token in tokens])
+        batch_words.append(
+            tokens_to_words(tokens, lang)
+        )  # [lang.index2word[token.item()] for token in tokens])
     return batch_words
+
+
+def tokens_to_words(tokens: Tensor, lang: Lang):
+    return [lang.index2word[token.item()] for token in tokens]
 
 
 def collate_fn(input_batch):
