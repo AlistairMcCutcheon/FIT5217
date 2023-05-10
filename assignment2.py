@@ -12,7 +12,8 @@ from torch.nn.utils.rnn import (
     pad_packed_sequence,
     pack_padded_sequence,
 )
-
+from nltk.translate.bleu_score import sentence_bleu
+from nltk.translate.meteor_score import meteor_score
 import torch.nn.functional as F
 import string
 from torch.utils.data import Dataset
@@ -23,7 +24,9 @@ from typing import Any, Iterable, Generator
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 import numpy as np
+import nltk
 
+nltk.download("wordnet")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SOS_TOKEN = 0
 EOS_TOKEN = 1
@@ -707,34 +710,33 @@ def train(
 
             optimiser.step()
 
-            writer.add_scalars(
-                "Loss", {"Train": loss.item()}, epoch * len(train_dataloader) + i
-            )
+            iteration = epoch * len(train_dataloader) + i
+            writer.add_scalars("Loss", {"Train": loss.item()}, iteration)
 
             if test_dataloader is None:
                 continue
             if i % 100 == 0:
-                eval(
+                dev_loss, dev_bleu, dev_meteor = eval(
                     dev_dataloader,
                     seq_to_seq,
                     criterion,
-                    epoch * len(train_dataloader) + i,
                     lang,
                 )
 
-
-from nltk.translate.bleu_score import sentence_bleu
+                writer.add_scalars("Loss", {"Dev": dev_loss}, iteration)
+                writer.add_scalars("Bleu", {"Dev": dev_bleu}, iteration)
+                writer.add_scalars("Meteor", {"Dev": dev_meteor}, iteration)
 
 
 def eval(
     dataloader: DataLoader,
     seq_to_seq: nn.Module,
     criterion: nn.Module,
-    iteration: int,
     lang: Lang,
 ):
     total_loss = 0
     total_bleu = 0
+    total_meteor = 0
     for input_tensor, target_tensor in dataloader:
         with torch.no_grad():
             parallel_output = seq_to_seq.forward(input_tensor, target_tensor)
@@ -750,48 +752,42 @@ def eval(
         output, output_lengths = pad_packed_sequence(
             sequential_output, batch_first=True
         )
-        # print(output)
-        # print(output.shape)
-        # output = torch.argmax(output, dim=2)
         target_tensor, target_lengths = pad_packed_sequence(
             target_tensor, batch_first=True
         )
-        # batch_words = batch_tokens_to_words(output)
-        # batch_target = batch_tokens_to_words(target_tensor)
         for target_text, target_length, output_text, output_length in zip(
             target_tensor, target_lengths, output, output_lengths
         ):
             target_text = target_text[1:target_length]
             output_text = output_text[:output_length]
-            # print(target_text)
-            # print(output_text)
-            # print(target_text.tolist())
-            # print(output_text.tolist())
-            # print([target_text.tolist()])
-            # print("Target:")
-            # print(tokens_to_words(target_text, lang))
-            # print("Output:")
-            # print(tokens_to_words(output_text, lang))
-            # print("Bleu Score:")
-            total_bleu += sentence_bleu([target_text.tolist()], output_text.tolist())
-    writer.add_scalars("Loss", {"Dev": total_loss / len(dataloader)}, iteration)
-    writer.add_scalars("Bleu", {"Dev": total_bleu / len(dataloader)}, iteration)
+            total_bleu += sentence_bleu(
+                [target_text.tolist()], output_text.tolist()
+            ) / len(output)
+            total_meteor += meteor_score(
+                [tokens_to_words(target_text, lang)],
+                tokens_to_words(output_text, lang),
+            ) / len(output)
 
-    test_text = "10 oz chopped broccoli, 2 tbsp butter, 2 tbsp flour, 1/2 tsp salt, 1/4 tsp black pepper, 1/4 tsp ground nutmeg, 1 cup milk, 1 1/2 cup shredded swiss cheese, 2 tsp lemon juice, 2 cup cooked cubed turkey, 4 oz mushrooms, 1/4 cup grated Parmesan cheese, 1 can refrigerated biscuits"
-    input = pack_sequence(
-        [
-            torch.tensor(
-                indexes_from_text(
-                    train_dataset.lang,
-                    test_text,
-                    sos_token=False,
-                    eos_token=True,
-                ),
-                dtype=torch.long,
-                device=DEVICE,
-            )
-        ]
+    return (
+        total_loss / len(dataloader),
+        total_bleu / len(dataloader),
+        total_meteor / len(dataloader),
     )
+    # test_text = "10 oz chopped broccoli, 2 tbsp butter, 2 tbsp flour, 1/2 tsp salt, 1/4 tsp black pepper, 1/4 tsp ground nutmeg, 1 cup milk, 1 1/2 cup shredded swiss cheese, 2 tsp lemon juice, 2 cup cooked cubed turkey, 4 oz mushrooms, 1/4 cup grated Parmesan cheese, 1 can refrigerated biscuits"
+    # input = pack_sequence(
+    #     [
+    #         torch.tensor(
+    #             indexes_from_text(
+    #                 train_dataset.lang,
+    #                 test_text,
+    #                 sos_token=False,
+    #                 eos_token=True,
+    #             ),
+    #             dtype=torch.long,
+    #             device=DEVICE,
+    #         )
+    #     ]
+    # )
     # print(inference(input, seq_to_seq, lang))
 
 
