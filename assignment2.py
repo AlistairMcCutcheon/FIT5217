@@ -178,28 +178,25 @@ class Lang:
         return index_to_count / torch.sum(index_to_count)
 
 
-class EncoderRNN(nn.Module):
-    def __init__(self, input_size, hidden_size, layers=1):
-        super(EncoderRNN, self).__init__()
-        self.hidden_size = hidden_size
+# class EncoderRNN(nn.Module):
+#     def __init__(self, hidden_size, layers=1):
+#         super(EncoderRNN, self).__init__()
+#         self.hidden_size = hidden_size
+#         self.gru = nn.GRU(hidden_size, hidden_size, num_layers=layers)
 
-        self.embedding = nn.Embedding(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size, num_layers=layers)
-
-    def forward(self, x: PackedSequence):
-        hidden_0 = torch.zeros((1, x.batch_sizes[0], self.hidden_size), device=DEVICE)
-        output, hidden = self.gru(x, hidden_0)
-        return output, hidden
+#     def forward(self, x: PackedSequence):
+#         output, hidden = self.gru(x)
+#         return output, hidden
 
 
-class DecoderRNN(nn.Module):
-    def __init__(self, hidden_size, layers=1):
-        super(DecoderRNN, self).__init__()
-        self.hidden_size = hidden_size
-        self.gru = nn.GRU(hidden_size, hidden_size, num_layers=layers)
+# class DecoderRNN(nn.Module):
+#     def __init__(self, hidden_size, layers=1):
+#         super(DecoderRNN, self).__init__()
+#         self.hidden_size = hidden_size
+#         self.gru = nn.GRU(hidden_size, hidden_size, num_layers=layers)
 
-    def forward(self, target: PackedSequence, hidden):
-        return self.gru(target, hidden)
+#     def forward(self, target: PackedSequence, hidden):
+#         return self.gru(target, hidden)
 
 
 class Embedding(nn.Module):
@@ -231,13 +228,13 @@ class Head(nn.Module):
 
 
 class AttnDecoderRNN(nn.Module):
-    def __init__(self, hidden_size, attn: nn.Module):
+    def __init__(self, attn: nn.Module, network: nn.Module):
         super(AttnDecoderRNN, self).__init__()
-        self.gru = nn.GRU(hidden_size, hidden_size)
+        self.network = network
         self.attn = attn
 
     def forward(self, x: PackedSequence, hidden, encoder_outputs: PackedSequence):
-        decoder_output, hidden = self.gru(x, hidden)
+        decoder_output, hidden = self.network(x, hidden)
 
         attn_out, attn_dist = self.attn(
             key=encoder_outputs, value=encoder_outputs, query=decoder_output
@@ -367,10 +364,10 @@ class BahdanauAttention(nn.Module):
 class SeqToSeq(nn.Module):
     def __init__(
         self,
-        encoder: EncoderRNN,
-        decoder: DecoderRNN,
+        encoder: nn.LSTM,
+        decoder: nn.LSTM,
         encoder_embedding: Embedding,
-        decoder_embedding,
+        decoder_embedding: Embedding,
         head: Head,
         max_len=150,
     ) -> None:
@@ -404,16 +401,25 @@ class SeqToSeq(nn.Module):
             x = self.head(decoder_output)
             x, lengths = pad_packed_sequence(x, batch_first=True)
             x = torch.argmax(x, dim=2)
-            outputs[:, timestep] = x  # in place operation
+            outputs[:, timestep] = x.squeeze(1)  # in place operation
             x = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
-        return outputs
+
+        outputs = torch.cat(
+            (outputs, torch.full((outputs.shape[0], 1), EOS_TOKEN, device=DEVICE)),
+            dim=1,
+        )
+        lengths = torch.argmax(torch.eq(outputs, EOS_TOKEN).to(torch.uint8), dim=1) + 1
+        return pack_padded_sequence(
+            outputs, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
 
 
 class SeqToSeqWithAttention(nn.Module):
     def __init__(
         self,
-        encoder: EncoderRNN,
-        decoder: AttnDecoderRNN,
+        encoder: nn.LSTM,
+        decoder: nn.LSTM,
+        attn: nn.Module,
         encoder_embedding: Embedding,
         decoder_embedding: Embedding,
         head: Head,
@@ -422,6 +428,7 @@ class SeqToSeqWithAttention(nn.Module):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.attn = attn
         self.encoder_embedding = encoder_embedding
         self.decoder_embedding = decoder_embedding
         self.head = head
@@ -446,7 +453,13 @@ class SeqToSeqWithAttention(nn.Module):
     def forward_decoder_parallel(
         self, x: PackedSequence, hidden: PackedSequence, encoder_outputs: PackedSequence
     ):
-        return self.decoder(self.decoder_embedding(x), hidden, encoder_outputs)
+        x = self.decoder_embedding(x)
+        decoder_output, hidden = self.decoder(x, hidden)
+
+        attn_out, attn_dist = self.attn(
+            key=encoder_outputs, value=encoder_outputs, query=decoder_output
+        )
+        return attn_out, decoder_output, attn_dist, hidden
 
     def forward_decoder_sequential(self, x, hidden, encoder_outputs):
         outputs = torch.zeros((x.batch_sizes[0], self.max_len), device=DEVICE)
@@ -458,16 +471,25 @@ class SeqToSeqWithAttention(nn.Module):
             x = self.head(features)
             x, lengths = pad_packed_sequence(x, batch_first=True)
             x = torch.argmax(x, dim=2)
-            outputs[:, timestep] = x  # in place operation
+            outputs[:, timestep] = x.squeeze(1)  # in place operation
             x = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
-        return outputs
+
+        outputs = torch.cat(
+            (outputs, torch.full((outputs.shape[0], 1), EOS_TOKEN, device=DEVICE)),
+            dim=1,
+        )
+        lengths = torch.argmax(torch.eq(outputs, EOS_TOKEN).to(torch.uint8), dim=1) + 1
+        return pack_padded_sequence(
+            outputs, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
 
 
 class GetToThePoint(nn.Module):
     def __init__(
         self,
-        encoder: EncoderRNN,
-        decoder: AttnDecoderRNN,
+        encoder: nn.LSTM,
+        decoder: nn.LSTM,
+        attn: nn.Module,
         encoder_embedding: Embedding,
         decoder_embedding: Embedding,
         head: Head,
@@ -476,6 +498,7 @@ class GetToThePoint(nn.Module):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.attn = attn
         self.encoder_embedding = encoder_embedding
         self.decoder_embedding = decoder_embedding
         self.head = head
@@ -488,8 +511,13 @@ class GetToThePoint(nn.Module):
             # print(pad_packed_sequence(x, batch_first=True)[0])
             # print(pad_packed_sequence(target, batch_first=True)[0])
             target = self.decoder_embedding(target)
-            attn_out, decoder_output, attn_dist, _ = self.decoder(
-                target, encoder_hidden, encoder_outputs
+            # attn_out, decoder_output, attn_dist, _ = self.decoder(
+            #     target, encoder_hidden, encoder_outputs
+            # )
+
+            decoder_output, _ = self.decoder(target, encoder_hidden)
+            attn_out, attn_dist = self.attn(
+                key=encoder_outputs, value=encoder_outputs, query=decoder_output
             )
 
             features = concat_packed_sequences(attn_out, decoder_output)
@@ -514,12 +542,18 @@ class GetToThePoint(nn.Module):
         outputs = torch.zeros((target.batch_sizes[0], self.max_len), device=DEVICE)
         for timestep in range(self.max_len):
             target = self.decoder_embedding(target)
-            (
-                attn_out,
-                decoder_outputs,
-                attn_dist,
-                hidden,
-            ) = self.decoder(target, hidden, encoder_outputs)
+            # (
+            #     attn_out,
+            #     decoder_outputs,
+            #     attn_dist,
+            #     hidden,
+            # ) = self.decoder(target, hidden, encoder_outputs)
+
+            decoder_outputs, hidden = self.decoder(target, hidden)
+            attn_out, attn_dist = self.attn(
+                key=encoder_outputs, value=encoder_outputs, query=decoder_outputs
+            )
+
             features = concat_packed_sequences(attn_out, decoder_outputs)
             vocab_dist = self.head(features)
             final_dist = self.pointer_gen(
@@ -853,9 +887,8 @@ hidden_size = 256
 
 encoder_embedding = Embedding(train_dataset.lang.n_words, hidden_size).to(DEVICE)
 decoder_embedding = Embedding(train_dataset.lang.n_words, hidden_size).to(DEVICE)
-encoder = EncoderRNN(train_dataset.lang.n_words, hidden_size).to(DEVICE)
-
-# decoder = DecoderRNN(hidden_size).to(DEVICE)
+encoder = nn.LSTM(hidden_size, hidden_size, 1).to(DEVICE)
+decoder = nn.LSTM(hidden_size, hidden_size, 1).to(DEVICE)
 # head = Head(hidden_size, train_dataset.lang.n_words)
 # seq_to_seq = SeqToSeq(encoder, decoder, encoder_embedding, decoder_embedding, head).to(
 #     DEVICE
@@ -865,16 +898,18 @@ encoder = EncoderRNN(train_dataset.lang.n_words, hidden_size).to(DEVICE)
 #     DEVICE
 # )
 # decoder = AttnDecoderRNN(hidden_size, DotProductAttention()).to(DEVICE)
+attn = DotProductAttention().to(DEVICE)
+attn = BahdanauAttention(hidden_size).to(DEVICE)
 
-decoder = AttnDecoderRNN(hidden_size, BahdanauAttention(256)).to(DEVICE)
+# decoder = AttnDecoderRNN(hidden_size, BahdanauAttention(256)).to(DEVICE)
 head = Head(2 * hidden_size, train_dataset.lang.n_words)
 # seq_to_seq = SeqToSeqWithAttention(
-#     encoder, decoder, encoder_embedding, decoder_embedding, head
+#     encoder, decoder, attn, encoder_embedding, decoder_embedding, head
 # ).to(DEVICE)
 
 pointer_gen = PointerGen(hidden_size).to(DEVICE)
 seq_to_seq = GetToThePoint(
-    encoder, decoder, encoder_embedding, decoder_embedding, head, pointer_gen
+    encoder, decoder, attn, encoder_embedding, decoder_embedding, head, pointer_gen
 ).to(DEVICE)
 
 writer = SummaryWriter()
