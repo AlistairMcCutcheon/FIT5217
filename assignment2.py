@@ -178,27 +178,6 @@ class Lang:
         return index_to_count / torch.sum(index_to_count)
 
 
-# class EncoderRNN(nn.Module):
-#     def __init__(self, hidden_size, layers=1):
-#         super(EncoderRNN, self).__init__()
-#         self.hidden_size = hidden_size
-#         self.gru = nn.GRU(hidden_size, hidden_size, num_layers=layers)
-
-#     def forward(self, x: PackedSequence):
-#         output, hidden = self.gru(x)
-#         return output, hidden
-
-
-# class DecoderRNN(nn.Module):
-#     def __init__(self, hidden_size, layers=1):
-#         super(DecoderRNN, self).__init__()
-#         self.hidden_size = hidden_size
-#         self.gru = nn.GRU(hidden_size, hidden_size, num_layers=layers)
-
-#     def forward(self, target: PackedSequence, hidden):
-#         return self.gru(target, hidden)
-
-
 class Embedding(nn.Module):
     def __init__(self, input_size, hidden_size, dropout=0.1) -> None:
         super().__init__()
@@ -508,21 +487,15 @@ class GetToThePoint(nn.Module):
     def forward(self, x, target):
         encoder_outputs, encoder_hidden = self.forward_encoder(x)
         if len(target.batch_sizes) > 1:
-            # print(pad_packed_sequence(x, batch_first=True)[0])
-            # print(pad_packed_sequence(target, batch_first=True)[0])
             target = self.decoder_embedding(target)
-            # attn_out, decoder_output, attn_dist, _ = self.decoder(
-            #     target, encoder_hidden, encoder_outputs
-            # )
-
             decoder_output, _ = self.decoder(target, encoder_hidden)
+
             attn_out, attn_dist = self.attn(
                 key=encoder_outputs, value=encoder_outputs, query=decoder_output
             )
 
             features = concat_packed_sequences(attn_out, decoder_output)
             vocab_dist = self.head(features)
-            # print(pad_packed_sequence(vocab_dist, batch_first=True)[0].shape)
             final_dist = self.pointer_gen(
                 input_tokens=x,
                 context=attn_out,
@@ -542,12 +515,6 @@ class GetToThePoint(nn.Module):
         outputs = torch.zeros((target.batch_sizes[0], self.max_len), device=DEVICE)
         for timestep in range(self.max_len):
             target = self.decoder_embedding(target)
-            # (
-            #     attn_out,
-            #     decoder_outputs,
-            #     attn_dist,
-            #     hidden,
-            # ) = self.decoder(target, hidden, encoder_outputs)
 
             decoder_outputs, hidden = self.decoder(target, hidden)
             attn_out, attn_dist = self.attn(
@@ -894,14 +861,9 @@ decoder = nn.LSTM(hidden_size, hidden_size, 1).to(DEVICE)
 #     DEVICE
 # )
 
-# decoder = AttnDecoderRNN(hidden_size, BahdanauAttention(256)).to(
-#     DEVICE
-# )
-# decoder = AttnDecoderRNN(hidden_size, DotProductAttention()).to(DEVICE)
 attn = DotProductAttention().to(DEVICE)
 attn = BahdanauAttention(hidden_size).to(DEVICE)
 
-# decoder = AttnDecoderRNN(hidden_size, BahdanauAttention(256)).to(DEVICE)
 head = Head(2 * hidden_size, train_dataset.lang.n_words)
 # seq_to_seq = SeqToSeqWithAttention(
 #     encoder, decoder, attn, encoder_embedding, decoder_embedding, head
