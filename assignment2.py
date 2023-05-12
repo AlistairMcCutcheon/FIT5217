@@ -179,12 +179,12 @@ class Lang:
 
 
 class EncoderRNN(nn.Module):
-    def __init__(self, input_size, hidden_size):
+    def __init__(self, input_size, hidden_size, layers=1):
         super(EncoderRNN, self).__init__()
         self.hidden_size = hidden_size
 
         self.embedding = nn.Embedding(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
+        self.gru = nn.GRU(hidden_size, hidden_size, num_layers=layers)
 
     def forward(self, x: PackedSequence):
         hidden_0 = torch.zeros((1, x.batch_sizes[0], self.hidden_size), device=DEVICE)
@@ -193,10 +193,10 @@ class EncoderRNN(nn.Module):
 
 
 class DecoderRNN(nn.Module):
-    def __init__(self, hidden_size):
+    def __init__(self, hidden_size, layers=1):
         super(DecoderRNN, self).__init__()
         self.hidden_size = hidden_size
-        self.gru = nn.GRU(hidden_size, hidden_size)
+        self.gru = nn.GRU(hidden_size, hidden_size, num_layers=layers)
 
     def forward(self, target: PackedSequence, hidden):
         return self.gru(target, hidden)
